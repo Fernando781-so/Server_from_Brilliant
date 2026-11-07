@@ -1,0 +1,189 @@
+const test = require('node:test');
+const assert = require('node:assert/strict');
+process.env.JWT_SECRET = 'test-only-secret';
+const jwt = require('jsonwebtoken');
+const { io: connectSocket } = require('socket.io-client');
+const { getTargetPoints, getZoneAward } = require('../server');
+const { io, server } = require('../server');
+
+test('configura el objetivo según la cantidad de jugadores', () => {
+  assert.equal(getTargetPoints(2), 26);
+  assert.equal(getTargetPoints(3), 24);
+  assert.equal(getTargetPoints(4), 22);
+  assert.equal(getTargetPoints(5), 21);
+  assert.equal(getTargetPoints(6), 20);
+  assert.throws(() => getTargetPoints(1), RangeError);
+});
+
+test('mantiene el puntaje mínimo de una zona luego de agotarse su bolsa', () => {
+  const pointValues = [8, 6, 4];
+  assert.equal(getZoneAward(pointValues, 0), 8);
+  assert.equal(getZoneAward(pointValues, 1), 6);
+  assert.equal(getZoneAward(pointValues, 2), 4);
+  assert.equal(getZoneAward(pointValues, 3), 4);
+  assert.equal(getZoneAward([8, 6, 4], 0), 8);
+  assert.equal(getZoneAward([8, 6, 4], 1), 6);
+  assert.equal(getZoneAward([8, 6, 4], 2), 4);
+});
+
+test('espera a que todos estén listos y sincroniza dados y premios por zona', async () => {
+  await new Promise((resolve) => server.listen(0, resolve));
+  const address = server.address();
+  const url = `http://127.0.0.1:${address.port}`;
+  const players = [
+    { id: 'player-1', username: 'Ana' },
+    { id: 'player-2', username: 'Luis' },
+  ];
+  const sockets = players.map((player) =>
+    connectSocket(url, {
+      auth: {
+        token: jwt.sign(player, 'test-only-secret', { expiresIn: '1h' }),
+      },
+      transports: ['websocket'],
+      reconnection: false,
+    }),
+  );
+
+  const waitFor = (socket, event) =>
+    new Promise((resolve) => socket.once(event, resolve));
+  const waitForTurn = (socket, turn) =>
+    new Promise((resolve) => {
+      const handleState = (state) => {
+        if (state.turn !== turn) return;
+        socket.off('game:state', handleState);
+        resolve(state);
+      };
+      socket.on('game:state', handleState);
+    });
+  const emit = (socket, event, payload) =>
+    new Promise((resolve, reject) => {
+      socket.emit(event, payload, (response) => {
+        if (response.ok) resolve(response);
+        else reject(new Error(response.error));
+      });
+    });
+
+  try {
+    await Promise.all(
+      sockets.map(
+        (socket) =>
+          new Promise((resolve, reject) => {
+            socket.once('connect', resolve);
+            socket.once('connect_error', reject);
+          }),
+      ),
+    );
+
+    const pointValues = [[8, 6, 4]];
+    const created = await emit(sockets[0], 'lobby:create', {
+      capacity: 2,
+      boardId: 1,
+      zonePointValues: pointValues,
+    });
+    await emit(sockets[1], 'lobby:join', { code: created.room.code });
+
+    const updatedRoomForPlayerTwo = waitFor(sockets[1], 'lobby:update');
+    const updatedRoom = await emit(sockets[0], 'lobby:board', {
+      boardId: 2,
+      zonePointValues: [[5, 3]],
+    });
+    assert.equal(updatedRoom.room.boardId, 2);
+    assert.equal((await updatedRoomForPlayerTwo).boardId, 2);
+    await assert.rejects(
+      emit(sockets[1], 'lobby:board', {
+        boardId: 3,
+        zonePointValues: [[4, 2]],
+      }),
+      /Solo el anfitrión puede cambiar el tablero/,
+    );
+    const readyRoomForPlayerTwo = waitFor(sockets[1], 'lobby:update');
+    await emit(sockets[0], 'lobby:ready', { ready: true });
+    await readyRoomForPlayerTwo;
+    const changedRoomForPlayerTwo = waitFor(sockets[1], 'lobby:update');
+    const changedRoom = await emit(sockets[0], 'lobby:board', {
+      boardId: 3,
+      zonePointValues: [[6, 4]],
+    });
+    assert.equal(changedRoom.room.boardId, 3);
+    assert.ok(changedRoom.room.players.every((player) => !player.ready));
+    assert.equal((await changedRoomForPlayerTwo).boardId, 3);
+
+    let startEvents = 0;
+    for (const socket of sockets) {
+      socket.on('game:start', () => {
+        startEvents += 1;
+      });
+    }
+    const playerOneStarted = waitFor(sockets[0], 'game:start');
+    const playerTwoStarted = waitFor(sockets[1], 'game:start');
+    await emit(sockets[0], 'lobby:ready', { ready: true });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(startEvents, 0);
+    await emit(sockets[1], 'lobby:ready', { ready: true });
+
+    const [firstGame, secondGame] = await Promise.all([
+      playerOneStarted,
+      playerTwoStarted,
+    ]);
+    assert.deepEqual(firstGame.dice, secondGame.dice);
+    assert.equal(firstGame.turn, 1);
+
+    const board = Array(49).fill(0);
+    const firstTurnForOne = waitFor(sockets[0], 'game:state');
+    await emit(sockets[0], 'game:turn-complete', {
+      board,
+      completedZones: [0],
+      finished: false,
+    });
+    const firstState = await firstTurnForOne;
+    assert.equal(firstState.turn, 1);
+    assert.equal(
+      firstState.room.players.find((player) => player.id === 'player-1').score,
+      6,
+    );
+
+    const nextTurnForOne = waitForTurn(sockets[0], 2);
+    const nextTurnForTwo = waitForTurn(sockets[1], 2);
+    await emit(sockets[1], 'game:turn-complete', {
+      board,
+      completedZones: [0],
+      finished: false,
+    });
+    const [secondState, secondStateForTwo] = await Promise.all([
+      nextTurnForOne,
+      nextTurnForTwo,
+    ]);
+    assert.equal(secondState.turn, 2);
+    assert.deepEqual(secondState.dice, secondStateForTwo.dice);
+    assert.deepEqual(secondState.zoneClaims['0'].map((claim) => claim.points), [
+      6,
+      4,
+    ]);
+    assert.deepEqual(
+      secondState.zoneClaims['0'].map((claim) => claim.username),
+      ['Ana', 'Luis'],
+    );
+
+    const turnAfterDisconnect = waitForTurn(sockets[0], 3);
+    await emit(sockets[0], 'game:turn-complete', {
+      board,
+      completedZones: [0],
+      finished: false,
+    });
+    sockets[1].disconnect();
+    const thirdState = await turnAfterDisconnect;
+    assert.equal(thirdState.turn, 3);
+    assert.deepEqual(thirdState.completedPlayerIds, []);
+    assert.deepEqual(thirdState.zoneClaims['0'].map((claim) => claim.points), [
+      6,
+      4,
+    ]);
+    assert.deepEqual(
+      thirdState.room.players.map((player) => player.score),
+      [6, 4],
+    );
+  } finally {
+    for (const socket of sockets) socket.disconnect();
+    await new Promise((resolve) => io.close(resolve));
+  }
+});
