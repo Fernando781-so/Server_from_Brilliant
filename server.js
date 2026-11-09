@@ -571,19 +571,37 @@ io.on('connection', (socket) => {
 });
 
 async function start() {
-  await ensureDatabaseReady();
   const port = process.env.PORT || 3000;
-  return new Promise((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(port, () => {
-      server.removeListener('error', reject);
-      console.log(`Servidor corriendo en el puerto ${port}`);
+  await new Promise((resolve, reject) => {
+    const handleError = (error) => {
+      server.removeListener('listening', handleListening);
+      reject(error);
+    };
+    const handleListening = () => {
+      server.removeListener('error', handleError);
       resolve();
-    });
+    };
+
+    server.once('error', handleError);
+    server.once('listening', handleListening);
+    server.listen(port, '0.0.0.0');
   });
+  console.log(`Servidor corriendo en el puerto ${port}`);
+
+  try {
+    await ensureDatabaseReady();
+  } catch (error) {
+    await new Promise((resolve) => server.close(resolve));
+    throw error;
+  }
 }
 
-if (require.main === module) start();
+if (require.main === module) {
+  start().catch((error) => {
+    console.error('Error al iniciar el servidor:', error);
+    process.exitCode = 1;
+  });
+}
 
 module.exports = {
   app,
