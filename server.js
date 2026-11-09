@@ -1,11 +1,10 @@
 const crypto = require('node:crypto');
 const http = require('node:http');
-const path = require('node:path');
 const express = require('express');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const cors = require('cors');
-const sqlite3 = require('sqlite3');
+const { Pool } = require('pg');
 const { Server } = require('socket.io');
 
 const app = express();
@@ -14,56 +13,50 @@ app.use(cors());
 
 const JWT_SECRET =
   process.env.JWT_SECRET || 'clave_secreta_super_segura_para_el_juego';
-const usersDatabase = new sqlite3.Database(
-  process.env.USERS_DB_PATH || path.join(__dirname, 'usuarios.db'),
-);
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: {
+    rejectUnauthorized: false,
+  },
+});
 const rooms = new Map();
 const TARGET_POINTS = { 2: 26, 3: 24, 4: 22, 5: 21, 6: 20 };
 
 function dbRun(query, values = []) {
-  return new Promise((resolve, reject) => {
-    usersDatabase.run(query, values, function (error) {
-      if (error) {
-        reject(error);
-      } else {
-        resolve(this);
-      }
-    });
-  });
+  return pool.query(query, values);
 }
 
-function dbGet(query, values = []) {
-  return new Promise((resolve, reject) => {
-    usersDatabase.get(query, values, (error, row) => {
-      if (error) {
-        reject(error);
-      } else {
-        resolve(row);
-      }
-    });
-  });
+async function dbGet(query, values = []) {
+  const result = await pool.query(query, values);
+  return result.rows[0];
 }
 
-const databaseReady = (async () => {
-  await dbRun(`
+let databaseReady;
+function ensureDatabaseReady() {
+  if (!databaseReady) {
+    databaseReady = (async () => {
+      await dbRun(`
     CREATE TABLE IF NOT EXISTS users (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      id SERIAL PRIMARY KEY,
       username TEXT NOT NULL UNIQUE,
       password TEXT NOT NULL
     )
   `);
-  const columns = await new Promise((resolve, reject) => {
-    usersDatabase.all('PRAGMA table_info(users)', (error, rows) => {
-      if (error) reject(error);
-      else resolve(rows.map((row) => row.name));
-    });
-  });
-  if (!columns.includes('username') && columns.includes('email')) {
-    await dbRun('ALTER TABLE users RENAME COLUMN email TO username');
-  } else if (!columns.includes('username')) {
-    throw new Error('La tabla users no contiene una columna username válida.');
+      const result = await pool.query(
+        `SELECT column_name
+         FROM information_schema.columns
+         WHERE table_schema = current_schema() AND table_name = 'users'`,
+      );
+      const columns = result.rows.map((row) => row.column_name);
+      if (!columns.includes('username') && columns.includes('email')) {
+        await dbRun('ALTER TABLE users RENAME COLUMN email TO username');
+      } else if (!columns.includes('username')) {
+        throw new Error('La tabla users no contiene una columna username válida.');
+      }
+    })();
   }
-})();
+  return databaseReady;
+}
 
 function getTargetPoints(playerCount) {
   const target = TARGET_POINTS[playerCount];
@@ -84,9 +77,9 @@ function getZoneAward(pointValues, claimCount) {
 app.post('/api/register', async (req, res) => {
   const { username, password } = req.body;
 
-  await databaseReady;
+  await ensureDatabaseReady();
   const existingUser = await dbGet(
-    'SELECT id FROM users WHERE username = ?',
+    'SELECT id FROM users WHERE username = $1',
     [username],
   );
   if (existingUser) {
@@ -96,11 +89,11 @@ app.post('/api/register', async (req, res) => {
   const hashedPassword = await bcrypt.hash(password, 10);
   try {
     await dbRun(
-      'INSERT INTO users (username, password) VALUES (?, ?)',
+      'INSERT INTO users (username, password) VALUES ($1, $2)',
       [username, hashedPassword],
     );
   } catch (error) {
-    if (error.code === 'SQLITE_CONSTRAINT') {
+    if (error.code === '23505') {
       return res.status(400).json({ error: 'El usuario ya existe' });
     }
     throw error;
@@ -112,9 +105,9 @@ app.post('/api/register', async (req, res) => {
 // LOGIN
 app.post('/api/login', async (req, res) => {
   const { username, password } = req.body;
-  await databaseReady;
+  await ensureDatabaseReady();
   const user = await dbGet(
-    'SELECT id, username, password FROM users WHERE username = ?',
+    'SELECT id, username, password FROM users WHERE username = $1',
     [username],
   );
 
@@ -142,8 +135,8 @@ app.delete('/api/delete-account', async (req, res) => {
   } catch {
     return res.status(403).json({ error: 'Token inválido o expirado' });
   }
-  await databaseReady;
-  await dbRun('DELETE FROM users WHERE id = ?', [decoded.id]);
+  await ensureDatabaseReady();
+  await dbRun('DELETE FROM users WHERE id = $1', [decoded.id]);
   res.json({ message: 'Cuenta eliminada permanentemente' });
 });
 
@@ -578,7 +571,7 @@ io.on('connection', (socket) => {
 });
 
 async function start() {
-  await databaseReady;
+  await ensureDatabaseReady();
   const port = process.env.PORT || 3000;
   return new Promise((resolve, reject) => {
     server.once('error', reject);
