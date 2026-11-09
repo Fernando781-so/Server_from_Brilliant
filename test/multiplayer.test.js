@@ -33,6 +33,7 @@ test('espera a que todos estén listos y sincroniza dados y premios por zona', a
   const players = [
     { id: 'player-1', username: 'Ana' },
     { id: 'player-2', username: 'Luis' },
+    { id: 'player-3', username: 'Marta' },
   ];
   const sockets = players.map((player) =>
     connectSocket(url, {
@@ -74,6 +75,21 @@ test('espera a que todos estén listos y sincroniza dados y premios por zona', a
       ),
     );
 
+    const invalidSocket = connectSocket(url, {
+      auth: { token: 'token-invalido' },
+      transports: ['websocket'],
+      reconnection: false,
+    });
+    const invalidConnection = new Promise((resolve, reject) => {
+      invalidSocket.once('connect_error', resolve);
+      invalidSocket.once('connect', () =>
+        reject(new Error('El servidor aceptó un token inválido.')),
+      );
+    });
+    const authenticationError = await invalidConnection;
+    assert.match(authenticationError.message, /Sesión inválida o expirada/);
+    invalidSocket.disconnect();
+
     const pointValues = [[8, 6, 4]];
     const created = await emit(sockets[0], 'lobby:create', {
       capacity: 2,
@@ -81,6 +97,18 @@ test('espera a que todos estén listos y sincroniza dados y premios por zona', a
       zonePointValues: pointValues,
     });
     await emit(sockets[1], 'lobby:join', { code: created.room.code });
+    await assert.rejects(
+      emit(sockets[2], 'lobby:join', { code: created.room.code }),
+      /La sala está llena/,
+    );
+    await assert.rejects(
+      emit(sockets[2], 'lobby:create', {
+        capacity: 7,
+        boardId: 1,
+        zonePointValues: pointValues,
+      }),
+      /entre 2 y 6 jugadores/,
+    );
 
     const updatedRoomForPlayerTwo = waitFor(sockets[1], 'lobby:update');
     const updatedRoom = await emit(sockets[0], 'lobby:board', {
@@ -129,6 +157,22 @@ test('espera a que todos estén listos y sincroniza dados y premios por zona', a
     assert.equal(firstGame.turn, 1);
 
     const board = Array(49).fill(0);
+    await assert.rejects(
+      emit(sockets[0], 'game:turn-complete', {
+        board: Array(48).fill(0),
+        completedZones: [0],
+        finished: false,
+      }),
+      /estado del tablero no es válido/,
+    );
+    await assert.rejects(
+      emit(sockets[2], 'game:turn-complete', {
+        board,
+        completedZones: [],
+        finished: false,
+      }),
+      /No estás en una sala activa/,
+    );
     const firstTurnForOne = waitFor(sockets[0], 'game:state');
     await emit(sockets[0], 'game:turn-complete', {
       board,
@@ -140,6 +184,14 @@ test('espera a que todos estén listos y sincroniza dados y premios por zona', a
     assert.equal(
       firstState.room.players.find((player) => player.id === 'player-1').score,
       6,
+    );
+    await assert.rejects(
+      emit(sockets[0], 'game:turn-complete', {
+        board,
+        completedZones: [0],
+        finished: false,
+      }),
+      /Ya completaste este turno/,
     );
 
     const nextTurnForOne = waitForTurn(sockets[0], 2);
