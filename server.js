@@ -190,6 +190,7 @@ function roomSummary(room) {
       connected: player.connected,
       score: player.score,
       finished: player.finished,
+      setupComplete: player.setupComplete,
     })),
   };
 }
@@ -199,6 +200,10 @@ function gameSnapshot(room, playerId) {
     room: roomSummary(room),
     turn: room.turn,
     dice: room.dice,
+    phase: room.phase,
+    setupCompletePlayerIds: [...room.players.values()]
+      .filter((player) => player.setupComplete)
+      .map((player) => player.id),
     completedPlayerIds: [...room.completedPlayerIds],
     zoneClaims: Object.fromEntries(
       [...room.zoneClaims.entries()].map(([zoneId, claims]) => [
@@ -223,7 +228,7 @@ function broadcastGame(room) {
 }
 
 function advanceTurnIfConnectedPlayersCompleted(room) {
-  if (room.status !== 'playing') return;
+  if (room.status !== 'playing' || room.phase !== 'playing') return;
 
   const connectedPlayers = [...room.players.values()].filter(
     (player) => player.connected && !player.finished,
@@ -235,6 +240,29 @@ function advanceTurnIfConnectedPlayersCompleted(room) {
     room.turn += 1;
     room.dice = rollDice();
     room.completedPlayerIds = new Set();
+  }
+}
+
+function validateSetupBoard(board) {
+  if (
+    !Array.isArray(board) ||
+    board.length !== 49 ||
+    board.some(
+      (value) => !Number.isInteger(value) || value < 0 || value > 6,
+    )
+  ) {
+    throw new Error('El estado del tablero no es válido.');
+  }
+
+  const startingNumbers = board.filter((value) => value !== 0);
+  if (
+    startingNumbers.length !== 6 ||
+    new Set(startingNumbers).size !== 6 ||
+    ![1, 2, 3, 4, 5, 6].every((number) =>
+      startingNumbers.includes(number),
+    )
+  ) {
+    throw new Error('Debes colocar una vez cada número del 1 al 6.');
   }
 }
 
@@ -317,6 +345,7 @@ io.on('connection', (socket) => {
               connected: true,
               score: 0,
               finished: false,
+              setupComplete: false,
               board: null,
             },
           ],
@@ -372,6 +401,7 @@ io.on('connection', (socket) => {
           connected: true,
           score: 0,
           finished: false,
+          setupComplete: false,
           board: null,
         });
       }
@@ -445,6 +475,7 @@ io.on('connection', (socket) => {
         [...room.players.values()].every((item) => item.ready);
       if (shouldStart) {
         room.status = 'playing';
+        room.phase = 'setup';
         room.turn = 1;
         room.dice = rollDice();
         room.zoneClaims = new Map();
@@ -460,10 +491,40 @@ io.on('connection', (socket) => {
     }
   });
 
+  socket.on('game:setup-complete', (payload = {}, ack) => {
+    try {
+      const room = getRoomForSocket(socket);
+      if (room.status !== 'playing' || room.phase !== 'setup') {
+        throw new Error('La configuración inicial ya terminó.');
+      }
+
+      const player = room.players.get(socket.data.user.id);
+      if (player.setupComplete) {
+        throw new Error('Ya confirmaste tu tablero inicial.');
+      }
+      validateSetupBoard(payload.board);
+      player.board = [...payload.board];
+      player.setupComplete = true;
+
+      if ([...room.players.values()].every((item) => item.setupComplete)) {
+        room.phase = 'playing';
+      }
+
+      const snapshot = gameSnapshot(room, player.id);
+      acknowledge(ack, { state: snapshot });
+      broadcastGame(room);
+    } catch (error) {
+      fail(ack, error);
+    }
+  });
+
   socket.on('game:turn-complete', (payload = {}, ack) => {
     try {
       const room = getRoomForSocket(socket);
       if (room.status !== 'playing') throw new Error('La partida no está activa.');
+      if (room.phase !== 'playing') {
+        throw new Error('Espera a que todos configuren su tablero inicial.');
+      }
 
       const playerId = socket.data.user.id;
       const player = room.players.get(playerId);

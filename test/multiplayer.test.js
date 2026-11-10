@@ -26,7 +26,7 @@ test('mantiene el puntaje mínimo de una zona luego de agotarse su bolsa', () =>
   assert.equal(getZoneAward([8, 6, 4], 2), 4);
 });
 
-test('espera a que todos estén listos y sincroniza dados y premios por zona', async () => {
+test('espera la configuración inicial, reconexión y turnos de todos', async () => {
   await new Promise((resolve) => server.listen(0, resolve));
   const address = server.address();
   const url = `http://127.0.0.1:${address.port}`;
@@ -51,6 +51,15 @@ test('espera a que todos estén listos y sincroniza dados y premios por zona', a
     new Promise((resolve) => {
       const handleState = (state) => {
         if (state.turn !== turn) return;
+        socket.off('game:state', handleState);
+        resolve(state);
+      };
+      socket.on('game:state', handleState);
+    });
+  const waitForGamePhase = (socket, phase) =>
+    new Promise((resolve) => {
+      const handleState = (state) => {
+        if (state.phase !== phase) return;
         socket.off('game:state', handleState);
         resolve(state);
       };
@@ -155,6 +164,97 @@ test('espera a que todos estén listos y sincroniza dados y premios por zona', a
     ]);
     assert.deepEqual(firstGame.dice, secondGame.dice);
     assert.equal(firstGame.turn, 1);
+    assert.equal(firstGame.phase, 'setup');
+    assert.deepEqual(firstGame.setupCompletePlayerIds, []);
+    assert.ok(
+      firstGame.room.players.every((player) => !player.setupComplete),
+    );
+
+    const setupBoard = Array(49).fill(0);
+    for (let number = 1; number <= 6; number += 1) {
+      setupBoard[number - 1] = number;
+    }
+    const invalidSetupBoard = [...setupBoard];
+    invalidSetupBoard[5] = 5;
+    await assert.rejects(
+      emit(sockets[0], 'game:setup-complete', {
+        board: invalidSetupBoard,
+      }),
+      /Debes colocar una vez cada número del 1 al 6/,
+    );
+    await assert.rejects(
+      emit(sockets[0], 'game:turn-complete', {
+        board: setupBoard,
+        completedZones: [],
+        finished: false,
+      }),
+      /Espera a que todos configuren su tablero inicial/,
+    );
+
+    const setupStateForOne = waitFor(sockets[0], 'game:state');
+    await emit(sockets[0], 'game:setup-complete', { board: setupBoard });
+    const firstSetupState = await setupStateForOne;
+    assert.equal(firstSetupState.phase, 'setup');
+    assert.deepEqual(firstSetupState.setupCompletePlayerIds, ['player-1']);
+    assert.equal(
+      firstSetupState.room.players.find((player) => player.id === 'player-1')
+        .setupComplete,
+      true,
+    );
+    assert.equal(
+      firstSetupState.room.players.find((player) => player.id === 'player-2')
+        .setupComplete,
+      false,
+    );
+
+    const disconnectedStateForOne = waitFor(sockets[0], 'game:state');
+    sockets[1].disconnect();
+    const disconnectedState = await disconnectedStateForOne;
+    assert.equal(disconnectedState.phase, 'setup');
+    assert.equal(
+      disconnectedState.room.players.find((player) => player.id === 'player-2')
+        .connected,
+      false,
+    );
+    assert.deepEqual(disconnectedState.setupCompletePlayerIds, ['player-1']);
+
+    const reconnectedSocket = connectSocket(url, {
+      auth: {
+        token: jwt.sign(players[1], 'test-only-secret', { expiresIn: '1h' }),
+      },
+      transports: ['websocket'],
+      reconnection: false,
+    });
+    sockets[1] = reconnectedSocket;
+    await new Promise((resolve, reject) => {
+      reconnectedSocket.once('connect', resolve);
+      reconnectedSocket.once('connect_error', reject);
+    });
+    const restoredGameState = waitFor(reconnectedSocket, 'game:state');
+    await emit(reconnectedSocket, 'lobby:join', { code: created.room.code });
+    const restoredGame = await restoredGameState;
+    assert.equal(restoredGame.phase, 'setup');
+    assert.equal(
+      restoredGame.room.players.find((player) => player.id === 'player-2')
+        .connected,
+      true,
+    );
+    assert.deepEqual(restoredGame.ownBoard, null);
+
+    const setupStateForBoth = [
+      waitForGamePhase(sockets[0], 'playing'),
+      waitForGamePhase(sockets[1], 'playing'),
+    ];
+    await emit(sockets[1], 'game:setup-complete', { board: setupBoard });
+    const [readyStateOne, readyStateTwo] = await Promise.all(setupStateForBoth);
+    for (const readyState of [readyStateOne, readyStateTwo]) {
+      assert.equal(readyState.phase, 'playing');
+      assert.deepEqual(readyState.setupCompletePlayerIds, [
+        'player-1',
+        'player-2',
+      ]);
+      assert.ok(readyState.room.players.every((player) => player.setupComplete));
+    }
 
     const board = Array(49).fill(0);
     await assert.rejects(
