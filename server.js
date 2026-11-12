@@ -12,6 +12,7 @@ const app = express();
 app.use(express.json());
 app.use(cors());
 
+const DISCONNECT_GRACE_PERIOD_MS = 10_000;
 const JWT_SECRET =
   process.env.JWT_SECRET || 'clave_secreta_super_segura_para_el_juego';
 const pool = new Pool({
@@ -169,7 +170,8 @@ function rollDice() {
 
 function getRoomForSocket(socket) {
   const room = rooms.get(socket.data.roomCode);
-  if (!room || !room.players.has(String(socket.data.user.id))) {
+  const player = room?.players.get(String(socket.data.user.id));
+  if (!room || !player || player.socketId !== socket.id) {
     throw new Error('No estás en una sala activa.');
   }
   return room;
@@ -227,6 +229,39 @@ function broadcastGame(room) {
   io.to(room.code).emit('game:state', gameSnapshot(room));
 }
 
+function cancelDisconnectTimer(room, playerId) {
+  const timer = room.disconnectTimers.get(playerId);
+  if (timer) clearTimeout(timer);
+  room.disconnectTimers.delete(playerId);
+}
+
+function finishRoom(room, winnerId) {
+  room.status = 'finished';
+  room.winnerId = winnerId;
+  for (const timer of room.disconnectTimers.values()) {
+    clearTimeout(timer);
+  }
+  room.disconnectTimers.clear();
+}
+
+function startGameIfReady(room) {
+  const shouldStart =
+    room.status === 'waiting' &&
+    room.players.size === room.capacity &&
+    [...room.players.values()].every(
+      (player) => player.connected && player.ready,
+    );
+  if (!shouldStart) return false;
+
+  room.status = 'playing';
+  room.phase = 'setup';
+  room.turn = 1;
+  room.dice = rollDice();
+  room.zoneClaims = new Map();
+  room.completedPlayerIds = new Set();
+  return true;
+}
+
 function advanceTurnIfConnectedPlayersCompleted(room) {
   if (room.status !== 'playing' || room.phase !== 'playing') return;
 
@@ -241,6 +276,53 @@ function advanceTurnIfConnectedPlayersCompleted(room) {
     room.dice = rollDice();
     room.completedPlayerIds = new Set();
   }
+}
+
+function handleDisconnectGracePeriodExpired(room, playerId) {
+  room.disconnectTimers.delete(playerId);
+  if (rooms.get(room.code) !== room) return;
+
+  const player = room.players.get(playerId);
+  if (!player || player.connected) return;
+
+  if (room.status === 'waiting') {
+    removePlayerFromWaitingRoom(room, playerId);
+    return;
+  }
+  if (room.status !== 'playing') return;
+
+  player.finished = true;
+  const playersStillInGame = [...room.players.values()].filter(
+    (item) => !item.finished,
+  );
+  const connectedPlayers = playersStillInGame.filter(
+    (item) => item.connected,
+  );
+  if (playersStillInGame.length === 1 && connectedPlayers.length === 1) {
+    finishRoom(room, connectedPlayers[0].id);
+  } else if (connectedPlayers.length > 0) {
+    if (
+      room.phase === 'setup' &&
+      playersStillInGame.every((item) => item.setupComplete)
+    ) {
+      room.phase = 'playing';
+    }
+    advanceTurnIfConnectedPlayersCompleted(room);
+  } else if (playersStillInGame.length === 0) {
+    finishRoom(room, null);
+  }
+
+  broadcastGame(room);
+}
+
+function startDisconnectGracePeriod(room, playerId) {
+  cancelDisconnectTimer(room, playerId);
+  const timer = setTimeout(
+    () => handleDisconnectGracePeriodExpired(room, playerId),
+    DISCONNECT_GRACE_PERIOD_MS,
+  );
+  timer.unref?.();
+  room.disconnectTimers.set(playerId, timer);
 }
 
 function validateSetupBoard(board) {
@@ -267,8 +349,13 @@ function validateSetupBoard(board) {
 }
 
 function removePlayerFromWaitingRoom(room, playerId) {
+  cancelDisconnectTimer(room, playerId);
   room.players.delete(playerId);
   if (room.players.size === 0) {
+    for (const timer of room.disconnectTimers.values()) {
+      clearTimeout(timer);
+    }
+    room.disconnectTimers.clear();
     rooms.delete(room.code);
     return;
   }
@@ -343,6 +430,7 @@ io.on('connection', (socket) => {
               username: user.username,
               ready: false,
               connected: true,
+              socketId: socket.id,
               score: 0,
               finished: false,
               setupComplete: false,
@@ -354,6 +442,7 @@ io.on('connection', (socket) => {
         dice: null,
         completedPlayerIds: new Set(),
         zoneClaims: new Map(),
+        disconnectTimers: new Map(),
         winnerId: null,
       };
       rooms.set(code, room);
@@ -376,6 +465,11 @@ io.on('connection', (socket) => {
 
       const user = socket.data.user;
       const existingPlayer = room.players.get(user.id);
+      if (existingPlayer?.finished) {
+        throw new Error(
+          'El tiempo para reconectarte terminó y quedaste fuera de la partida.',
+        );
+      }
       if (!existingPlayer && room.status !== 'waiting') {
         throw new Error('La partida ya comenzó.');
       }
@@ -392,13 +486,16 @@ io.on('connection', (socket) => {
       if (alreadyPlaying) throw new Error('Ya estás participando en otra sala.');
 
       if (existingPlayer) {
+        cancelDisconnectTimer(room, user.id);
         existingPlayer.connected = true;
+        existingPlayer.socketId = socket.id;
       } else {
         room.players.set(user.id, {
           id: user.id,
           username: user.username,
           ready: false,
           connected: true,
+          socketId: socket.id,
           score: 0,
           finished: false,
           setupComplete: false,
@@ -408,8 +505,11 @@ io.on('connection', (socket) => {
 
       socket.join(code);
       socket.data.roomCode = code;
+      const started = startGameIfReady(room);
       acknowledge(ack, { room: roomSummary(room), playerId: user.id });
-      if (room.status === 'playing') {
+      if (started) {
+        io.to(room.code).emit('game:start', gameSnapshot(room));
+      } else if (room.status === 'playing') {
         socket.emit('game:state', gameSnapshot(room, user.id));
         broadcastGame(room);
       } else {
@@ -470,17 +570,7 @@ io.on('connection', (socket) => {
       }
       const player = room.players.get(socket.data.user.id);
       player.ready = payload.ready === true;
-      const shouldStart =
-        room.players.size === room.capacity &&
-        [...room.players.values()].every((item) => item.ready);
-      if (shouldStart) {
-        room.status = 'playing';
-        room.phase = 'setup';
-        room.turn = 1;
-        room.dice = rollDice();
-        room.zoneClaims = new Map();
-        room.completedPlayerIds = new Set();
-      }
+      const shouldStart = startGameIfReady(room);
       acknowledge(ack, { room: roomSummary(room) });
       broadcastRoom(room);
       if (shouldStart) {
@@ -571,17 +661,18 @@ io.on('connection', (socket) => {
       room.completedPlayerIds.add(playerId);
 
       if (player.score >= room.targetPoints) {
-        room.status = 'finished';
-        room.winnerId = playerId;
+        finishRoom(room, playerId);
       } else {
         const remainingPlayers = [...room.players.values()].filter(
           (item) => !item.finished,
         );
         if (remainingPlayers.length === 0) {
-          room.status = 'finished';
-          room.winnerId = [...room.players.values()].sort(
-            (left, right) => right.score - left.score,
-          )[0].id;
+          finishRoom(
+            room,
+            [...room.players.values()].sort(
+              (left, right) => right.score - left.score,
+            )[0].id,
+          );
         } else {
           advanceTurnIfConnectedPlayersCompleted(room);
         }
@@ -606,6 +697,8 @@ io.on('connection', (socket) => {
       } else {
         const player = room.players.get(playerId);
         player.connected = false;
+        player.socketId = null;
+        startDisconnectGracePeriod(room, playerId);
         advanceTurnIfConnectedPlayersCompleted(room);
         broadcastGame(room);
       }
@@ -621,11 +714,14 @@ io.on('connection', (socket) => {
     if (!room) return;
 
     const player = room.players.get(socket.data.user.id);
-    if (!player) return;
+    if (!player || player.socketId !== socket.id) return;
+    player.socketId = null;
+    player.connected = false;
     if (room.status === 'waiting') {
-      removePlayerFromWaitingRoom(room, player.id);
+      startDisconnectGracePeriod(room, player.id);
+      broadcastRoom(room);
     } else if (room.status === 'playing') {
-      player.connected = false;
+      startDisconnectGracePeriod(room, player.id);
       advanceTurnIfConnectedPlayersCompleted(room);
       broadcastGame(room);
     }
@@ -672,5 +768,6 @@ module.exports = {
   rooms,
   getTargetPoints,
   getZoneAward,
+  DISCONNECT_GRACE_PERIOD_MS,
   start,
 };

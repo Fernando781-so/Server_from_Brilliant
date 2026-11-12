@@ -3,7 +3,11 @@ const assert = require('node:assert/strict');
 process.env.JWT_SECRET = 'test-only-secret';
 const jwt = require('jsonwebtoken');
 const { io: connectSocket } = require('socket.io-client');
-const { getTargetPoints, getZoneAward } = require('../server');
+const {
+  DISCONNECT_GRACE_PERIOD_MS,
+  getTargetPoints,
+  getZoneAward,
+} = require('../server');
 const { io, server } = require('../server');
 
 test('configura el objetivo según la cantidad de jugadores', () => {
@@ -60,6 +64,15 @@ test('espera la configuración inicial, reconexión y turnos de todos', async ()
     new Promise((resolve) => {
       const handleState = (state) => {
         if (state.phase !== phase) return;
+        socket.off('game:state', handleState);
+        resolve(state);
+      };
+      socket.on('game:state', handleState);
+    });
+  const waitForFinishedGame = (socket) =>
+    new Promise((resolve) => {
+      const handleState = (state) => {
+        if (state.room.status !== 'finished') return;
         socket.off('game:state', handleState);
         resolve(state);
       };
@@ -317,6 +330,8 @@ test('espera la configuración inicial, reconexión y turnos de todos', async ()
     );
 
     const turnAfterDisconnect = waitForTurn(sockets[0], 3);
+    const finishedGameForOne = waitForFinishedGame(sockets[0]);
+    const disconnectStartedAt = Date.now();
     await emit(sockets[0], 'game:turn-complete', {
       board,
       completedZones: [0],
@@ -333,6 +348,15 @@ test('espera la configuración inicial, reconexión y turnos de todos', async ()
     assert.deepEqual(
       thirdState.room.players.map((player) => player.score),
       [6, 4],
+    );
+    const finishedGame = await finishedGameForOne;
+    assert.ok(Date.now() - disconnectStartedAt >= DISCONNECT_GRACE_PERIOD_MS);
+    assert.equal(finishedGame.room.status, 'finished');
+    assert.equal(finishedGame.winnerId, 'player-1');
+    assert.equal(
+      finishedGame.room.players.find((player) => player.id === 'player-2')
+        .finished,
+      true,
     );
   } finally {
     for (const socket of sockets) socket.disconnect();
