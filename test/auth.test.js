@@ -21,6 +21,16 @@ test('solo permite un inicio de sesión hasta que se cierre la sesión activa', 
         rowCount: account.username === values[0] ? 1 : 0,
       };
     }
+    if (
+      query.includes(
+        'SELECT id, username, password, active_session_id FROM users',
+      )
+    ) {
+      return {
+        rows: account.username === values[0] ? [account] : [],
+        rowCount: account.username === values[0] ? 1 : 0,
+      };
+    }
     if (query.includes('UPDATE users SET active_session_id = NULL')) {
       if (
         account.id === values[0] &&
@@ -28,6 +38,19 @@ test('solo permite un inicio de sesión hasta que se cierre la sesión activa', 
       ) {
         account.active_session_id = null;
         return { rows: [], rowCount: 1 };
+      }
+      return { rows: [], rowCount: 0 };
+    }
+    if (
+      query.includes('UPDATE users') &&
+      query.includes('active_session_id = $3')
+    ) {
+      if (
+        account.id === values[0] &&
+        account.active_session_id === values[1]
+      ) {
+        account.active_session_id = values[2];
+        return { rows: [{ id: account.id }], rowCount: 1 };
       }
       return { rows: [], rowCount: 0 };
     }
@@ -68,12 +91,50 @@ test('solo permite un inicio de sesión hasta que se cierre la sesión activa', 
 
     const secondLogin = await login();
     assert.equal(secondLogin.status, 409);
+    assert.equal((await secondLogin.json()).code, 'SESSION_ACTIVE');
+
+    const invalidRecovery = await request('/login/recover', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        username: account.username,
+        password: 'incorrecta',
+      }),
+    });
+    assert.equal(invalidRecovery.status, 401);
+
+    const recovery = await request('/login/recover', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: account.username, password: 'secreto' }),
+    });
+    assert.equal(recovery.status, 200);
+    const { token: recoveredToken } = await recovery.json();
+
+    const oldSession = await request('/session', {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    assert.equal(oldSession.status, 401);
+    const recoveredSession = await request('/session', {
+      headers: { Authorization: `Bearer ${recoveredToken}` },
+    });
+    assert.equal(recoveredSession.status, 200);
+
+    const concurrentLogin = await login();
+    assert.equal(concurrentLogin.status, 409);
 
     const logout = await request('/logout', {
       method: 'POST',
-      headers: { Authorization: `Bearer ${token}` },
+      headers: { Authorization: `Bearer ${recoveredToken}` },
     });
     assert.equal(logout.status, 200);
+
+    const unnecessaryRecovery = await request('/login/recover', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: account.username, password: 'secreto' }),
+    });
+    assert.equal(unnecessaryRecovery.status, 409);
 
     const nextLogin = await login();
     assert.equal(nextLogin.status, 200);

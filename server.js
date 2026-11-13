@@ -161,6 +161,7 @@ app.post('/api/login', async (req, res) => {
   );
   if (result.rowCount === 0) {
     return res.status(409).json({
+      code: 'SESSION_ACTIVE',
       error: 'Esta cuenta ya tiene una sesión activa. Cierra sesión en el otro dispositivo.',
     });
   }
@@ -170,6 +171,46 @@ app.post('/api/login', async (req, res) => {
     JWT_SECRET,
   );
   res.json({ message: 'Login exitoso', token });
+});
+
+app.post('/api/login/recover', async (req, res) => {
+  const { username, password } = req.body;
+  await ensureDatabaseReady();
+  const user = await dbGet(
+    'SELECT id, username, password, active_session_id FROM users WHERE username = $1',
+    [username],
+  );
+
+  if (!user || !(await bcrypt.compare(password, user.password))) {
+    return res.status(401).json({ error: 'Credenciales inválidas' });
+  }
+  if (!user.active_session_id) {
+    return res.status(409).json({
+      error: 'No hay una sesión activa que recuperar. Inicia sesión normalmente.',
+    });
+  }
+
+  const previousSessionId = user.active_session_id;
+  const sessionId = crypto.randomUUID();
+  const result = await dbRun(
+    `UPDATE users
+     SET active_session_id = $3
+     WHERE id = $1 AND active_session_id = $2
+     RETURNING id`,
+    [user.id, previousSessionId, sessionId],
+  );
+  if (result.rowCount === 0) {
+    return res.status(409).json({
+      error: 'La sesión ya cambió. Intenta iniciar sesión nuevamente.',
+    });
+  }
+
+  disconnectUserSession(previousSessionId);
+  const token = jwt.sign(
+    { id: user.id, username: user.username, sessionId },
+    JWT_SECRET,
+  );
+  res.json({ message: 'Sesión anterior cerrada', token });
 });
 
 app.get('/api/session', async (req, res) => {
