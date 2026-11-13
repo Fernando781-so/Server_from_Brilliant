@@ -669,7 +669,7 @@ io.on('connection', (socket) => {
   socket.on('game:setup-complete', (payload = {}, ack) => {
     try {
       const room = getRoomForSocket(socket);
-      if (room.status !== 'playing' || room.phase !== 'setup') {
+      if (room.status !== 'playing') {
         throw new Error('La configuración inicial ya terminó.');
       }
 
@@ -697,7 +697,10 @@ io.on('connection', (socket) => {
     try {
       const room = getRoomForSocket(socket);
       if (room.status !== 'playing') throw new Error('La partida no está activa.');
-      if (room.phase !== 'playing') {
+      if (
+        room.phase !== 'playing' ||
+        [...room.players.values()].some((item) => !item.setupComplete)
+      ) {
         throw new Error('Espera a que todos configuren su tablero inicial.');
       }
 
