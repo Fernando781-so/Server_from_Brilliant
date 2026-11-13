@@ -41,7 +41,8 @@ function ensureDatabaseReady() {
     CREATE TABLE IF NOT EXISTS users (
       id SERIAL PRIMARY KEY,
       username TEXT NOT NULL,
-      password TEXT NOT NULL
+      password TEXT NOT NULL,
+      active_session_id TEXT
     )
   `);
       const result = await pool.query(
@@ -55,6 +56,9 @@ function ensureDatabaseReady() {
       } else if (!columns.includes('username')) {
         throw new Error('La tabla users no contiene una columna username válida.');
       }
+      await dbRun(
+        'ALTER TABLE users ADD COLUMN IF NOT EXISTS active_session_id TEXT',
+      );
       await dbRun(
         'CREATE UNIQUE INDEX IF NOT EXISTS users_username_unique_idx ON users (username)',
       );
@@ -76,6 +80,42 @@ function getZoneAward(pointValues, claimCount) {
     throw new TypeError('La zona no tiene una bolsa de puntos válida.');
   }
   return pointValues[Math.min(claimCount, pointValues.length - 1)];
+}
+
+function getDecodedToken(req, res) {
+  const authorization = req.headers.authorization;
+  if (!authorization || !authorization.startsWith('Bearer ')) {
+    res.status(401).json({ error: 'No autorizado' });
+    return null;
+  }
+
+  try {
+    return jwt.verify(authorization.slice('Bearer '.length), JWT_SECRET);
+  } catch {
+    res.status(403).json({ error: 'Token inválido o expirado' });
+    return null;
+  }
+}
+
+async function getActiveRequestUser(req, res) {
+  const decoded = getDecodedToken(req, res);
+  if (!decoded) return null;
+  if (!decoded.sessionId) {
+    res.status(401).json({ error: 'Esta sesión ya no está activa' });
+    return null;
+  }
+
+  await ensureDatabaseReady();
+  const activeUser = await dbGet(
+    'SELECT id FROM users WHERE id = $1 AND active_session_id = $2',
+    [decoded.id, decoded.sessionId],
+  );
+  if (!activeUser) {
+    res.status(401).json({ error: 'Esta sesión ya no está activa' });
+    return null;
+  }
+
+  return decoded;
 }
 
 // REGISTRO
@@ -111,28 +151,51 @@ app.post('/api/login', async (req, res) => {
     return res.status(401).json({ error: 'Credenciales inválidas' });
   }
 
+  const sessionId = crypto.randomUUID();
+  const result = await dbRun(
+    `UPDATE users
+     SET active_session_id = $2
+     WHERE id = $1 AND active_session_id IS NULL
+     RETURNING id`,
+    [user.id, sessionId],
+  );
+  if (result.rowCount === 0) {
+    return res.status(409).json({
+      error: 'Esta cuenta ya tiene una sesión activa. Cierra sesión en el otro dispositivo.',
+    });
+  }
+
   const token = jwt.sign(
-    { id: user.id, username: user.username },
+    { id: user.id, username: user.username, sessionId },
     JWT_SECRET,
-    { expiresIn: '2h' },
   );
   res.json({ message: 'Login exitoso', token });
 });
 
+app.get('/api/session', async (req, res) => {
+  const user = await getActiveRequestUser(req, res);
+  if (!user) return;
+  res.json({ username: user.username });
+});
+
+app.post('/api/logout', async (req, res) => {
+  const user = await getActiveRequestUser(req, res);
+  if (!user) return;
+
+  await dbRun(
+    'UPDATE users SET active_session_id = NULL WHERE id = $1 AND active_session_id = $2',
+    [user.id, user.sessionId],
+  );
+  disconnectUserSession(user.sessionId);
+  res.json({ message: 'Sesión cerrada exitosamente' });
+});
+
 // BORRAR CUENTA
 app.delete('/api/delete-account', async (req, res) => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader) return res.status(401).json({ error: 'No autorizado' });
-
-  const token = authHeader.split(' ')[1];
-  let decoded;
-  try {
-    decoded = jwt.verify(token, JWT_SECRET);
-  } catch {
-    return res.status(403).json({ error: 'Token inválido o expirado' });
-  }
-  await ensureDatabaseReady();
-  await dbRun('DELETE FROM users WHERE id = $1', [decoded.id]);
+  const user = await getActiveRequestUser(req, res);
+  if (!user) return;
+  await dbRun('DELETE FROM users WHERE id = $1', [user.id]);
+  disconnectUserSession(user.sessionId);
   res.json({ message: 'Cuenta eliminada permanentemente' });
 });
 
@@ -147,14 +210,42 @@ const io = new Server(server, {
   cors: { origin: '*', methods: ['GET', 'POST'] },
 });
 
-io.use((socket, next) => {
+function disconnectUserSession(sessionId) {
+  for (const socket of io.sockets.sockets.values()) {
+    if (socket.data.user?.sessionId === sessionId) {
+      socket.disconnect(true);
+    }
+  }
+}
+
+io.use(async (socket, next) => {
+  const token = socket.handshake.auth && socket.handshake.auth.token;
+  if (!token) {
+    return next(new Error('Inicia sesión para entrar a una sala.'));
+  }
+
+  let user;
   try {
-    const token = socket.handshake.auth && socket.handshake.auth.token;
-    if (!token) throw new Error('Inicia sesión para entrar a una sala.');
-    socket.data.user = jwt.verify(token, JWT_SECRET);
+    user = jwt.verify(token, JWT_SECRET);
+  } catch {
+    next(new Error('Sesión inválida o expirada. Vuelve a iniciar sesión.'));
+    return;
+  }
+
+  try {
+    await ensureDatabaseReady();
+    const activeUser = await dbGet(
+      'SELECT id FROM users WHERE id = $1 AND active_session_id = $2',
+      [user.id, user.sessionId],
+    );
+    if (!activeUser) {
+      next(new Error('Esta sesión ya no está activa. Vuelve a iniciar sesión.'));
+      return;
+    }
+    socket.data.user = user;
     next();
   } catch (error) {
-    next(new Error('Sesión inválida o expirada. Vuelve a iniciar sesión.'));
+    next(error);
   }
 });
 
@@ -759,6 +850,7 @@ module.exports = {
   app,
   server,
   io,
+  pool,
   rooms,
   getTargetPoints,
   getZoneAward,

@@ -8,7 +8,17 @@ const {
   getTargetPoints,
   getZoneAward,
 } = require('../server');
-const { io, server } = require('../server');
+const { io, pool, server } = require('../server');
+
+pool.query = async (query, values = []) => {
+  if (query.includes('information_schema.columns')) {
+    return { rows: [{ column_name: 'username' }] };
+  }
+  if (query.includes('active_session_id = $2')) {
+    return { rows: [{ id: values[0] }], rowCount: 1 };
+  }
+  return { rows: [], rowCount: 0 };
+};
 
 test('configura el objetivo según la cantidad de jugadores', () => {
   assert.equal(getTargetPoints(2), 26);
@@ -42,7 +52,11 @@ test('espera la configuración inicial, reconexión y turnos de todos', async ()
   const sockets = players.map((player) =>
     connectSocket(url, {
       auth: {
-        token: jwt.sign(player, 'test-only-secret', { expiresIn: '1h' }),
+        token: jwt.sign(
+          { ...player, sessionId: `session-${player.id}` },
+          'test-only-secret',
+          { expiresIn: '1h' },
+        ),
       },
       transports: ['websocket'],
       reconnection: false,
