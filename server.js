@@ -40,7 +40,7 @@ function ensureDatabaseReady() {
       await dbRun(`
     CREATE TABLE IF NOT EXISTS users (
       id SERIAL PRIMARY KEY,
-      username TEXT NOT NULL UNIQUE,
+      username TEXT NOT NULL,
       password TEXT NOT NULL
     )
   `);
@@ -55,6 +55,9 @@ function ensureDatabaseReady() {
       } else if (!columns.includes('username')) {
         throw new Error('La tabla users no contiene una columna username válida.');
       }
+      await dbRun(
+        'CREATE UNIQUE INDEX IF NOT EXISTS users_username_unique_idx ON users (username)',
+      );
     })();
   }
   return databaseReady;
@@ -80,25 +83,16 @@ app.post('/api/register', async (req, res) => {
   const { username, password } = req.body;
 
   await ensureDatabaseReady();
-  const existingUser = await dbGet(
-    'SELECT id FROM users WHERE username = $1',
-    [username],
-  );
-  if (existingUser) {
-    return res.status(400).json({ error: 'El usuario ya existe' });
-  }
-
   const hashedPassword = await bcrypt.hash(password, 10);
-  try {
-    await dbRun(
-      'INSERT INTO users (username, password) VALUES ($1, $2)',
-      [username, hashedPassword],
-    );
-  } catch (error) {
-    if (error.code === '23505') {
-      return res.status(400).json({ error: 'El usuario ya existe' });
-    }
-    throw error;
+  const result = await dbRun(
+    `INSERT INTO users (username, password)
+     VALUES ($1, $2)
+     ON CONFLICT (username) DO NOTHING
+     RETURNING id`,
+    [username, hashedPassword],
+  );
+  if (result.rowCount === 0) {
+    return res.status(409).json({ error: 'El usuario ya existe' });
   }
 
   res.status(201).json({ message: 'Cuenta creada exitosamente' });
