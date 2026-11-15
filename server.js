@@ -344,6 +344,13 @@ function gameSnapshot(room, playerId) {
   if (playerId !== undefined) {
     snapshot.ownBoard = room.players.get(String(playerId))?.board || null;
   }
+  if (room.status === 'finished') {
+    snapshot.playerBoards = Object.fromEntries(
+      [...room.players.values()]
+        .filter((player) => Array.isArray(player.board))
+        .map((player) => [player.id, [...player.board]]),
+    );
+  }
   return snapshot;
 }
 

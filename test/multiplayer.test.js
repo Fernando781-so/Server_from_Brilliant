@@ -308,6 +308,7 @@ test('espera la configuración inicial, reconexión y turnos de todos', async ()
     });
     const firstState = await firstTurnForOne;
     assert.equal(firstState.turn, 1);
+    assert.equal(firstState.playerBoards, undefined);
     assert.equal(
       firstState.room.players.find((player) => player.id === 'player-1').score,
       6,
@@ -367,6 +368,10 @@ test('espera la configuración inicial, reconexión y turnos de todos', async ()
     assert.ok(Date.now() - disconnectStartedAt >= DISCONNECT_GRACE_PERIOD_MS);
     assert.equal(finishedGame.room.status, 'finished');
     assert.equal(finishedGame.winnerId, 'player-1');
+    assert.deepEqual(finishedGame.playerBoards, {
+      'player-1': board,
+      'player-2': board,
+    });
     assert.equal(
       finishedGame.room.players.find((player) => player.id === 'player-2')
         .finished,
