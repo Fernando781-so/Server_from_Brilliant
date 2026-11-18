@@ -12,7 +12,23 @@ const app = express();
 app.use(express.json());
 app.use(cors());
 
-const DISCONNECT_GRACE_PERIOD_MS = 10_000;
+const DEFAULT_DISCONNECT_GRACE_PERIOD_MS = 5 * 60 * 1000;
+const configuredDisconnectGracePeriod = process.env.DISCONNECT_GRACE_PERIOD_MS;
+const parsedDisconnectGracePeriod = Number(configuredDisconnectGracePeriod);
+if (
+  configuredDisconnectGracePeriod !== undefined &&
+  (!/^\d+$/.test(configuredDisconnectGracePeriod) ||
+    !Number.isSafeInteger(parsedDisconnectGracePeriod) ||
+    parsedDisconnectGracePeriod < 1)
+) {
+  throw new RangeError(
+    'DISCONNECT_GRACE_PERIOD_MS debe ser un entero positivo y seguro.',
+  );
+}
+const DISCONNECT_GRACE_PERIOD_MS =
+  configuredDisconnectGracePeriod === undefined
+    ? DEFAULT_DISCONNECT_GRACE_PERIOD_MS
+    : parsedDisconnectGracePeriod;
 const JWT_SECRET =
   process.env.JWT_SECRET || 'clave_secreta_super_segura_para_el_juego';
 const pool = new Pool({
@@ -905,6 +921,7 @@ module.exports = {
   rooms,
   getTargetPoints,
   getZoneAward,
+  DEFAULT_DISCONNECT_GRACE_PERIOD_MS,
   DISCONNECT_GRACE_PERIOD_MS,
   start,
 };

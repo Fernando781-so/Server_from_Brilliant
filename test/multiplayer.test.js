@@ -1,9 +1,11 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 process.env.JWT_SECRET = 'test-only-secret';
+process.env.DISCONNECT_GRACE_PERIOD_MS = '100';
 const jwt = require('jsonwebtoken');
 const { io: connectSocket } = require('socket.io-client');
 const {
+  DEFAULT_DISCONNECT_GRACE_PERIOD_MS,
   DISCONNECT_GRACE_PERIOD_MS,
   getTargetPoints,
   getZoneAward,
@@ -38,6 +40,11 @@ test('mantiene el puntaje mínimo de una zona luego de agotarse su bolsa', () =>
   assert.equal(getZoneAward([8, 6, 4], 0), 8);
   assert.equal(getZoneAward([8, 6, 4], 1), 6);
   assert.equal(getZoneAward([8, 6, 4], 2), 4);
+});
+
+test('usa cinco minutos de gracia por defecto y permite reducirlo en pruebas', () => {
+  assert.equal(DEFAULT_DISCONNECT_GRACE_PERIOD_MS, 5 * 60 * 1000);
+  assert.equal(DISCONNECT_GRACE_PERIOD_MS, 100);
 });
 
 test('espera la configuración inicial, reconexión y turnos de todos', async () => {
