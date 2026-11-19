@@ -134,6 +134,60 @@ test('espera la configuración inicial, reconexión y turnos de todos', async ()
     invalidSocket.disconnect();
 
     const pointValues = [[8, 6, 4]];
+    const waitingRoom = await emit(sockets[0], 'lobby:create', {
+      capacity: 2,
+      boardId: 1,
+      zonePointValues: pointValues,
+    });
+    const joinedWaitingRoom = waitFor(sockets[0], 'lobby:update');
+    await emit(sockets[2], 'lobby:join', { code: waitingRoom.room.code });
+    assert.equal(
+      (await joinedWaitingRoom).players.some(
+        (player) => player.id === 'player-3',
+      ),
+      true,
+    );
+
+    const playerRemovedFromWaitingRoom = new Promise((resolve) => {
+      const handleUpdate = (room) => {
+        if (room.players.some((player) => player.id === 'player-3')) return;
+        sockets[0].off('lobby:update', handleUpdate);
+        resolve(room);
+      };
+      sockets[0].on('lobby:update', handleUpdate);
+    });
+    sockets[2].disconnect();
+    const updatedWaitingRoom = await playerRemovedFromWaitingRoom;
+    assert.deepEqual(
+      updatedWaitingRoom.players.map((player) => player.id),
+      ['player-1'],
+    );
+
+    const reconnectedWaitingPlayer = connectSocket(url, {
+      auth: {
+        token: jwt.sign(
+          { ...players[2], sessionId: 'session-player-3' },
+          'test-only-secret',
+          { expiresIn: '1h' },
+        ),
+      },
+      transports: ['websocket'],
+      reconnection: false,
+    });
+    sockets[2] = reconnectedWaitingPlayer;
+    await new Promise((resolve, reject) => {
+      reconnectedWaitingPlayer.once('connect', resolve);
+      reconnectedWaitingPlayer.once('connect_error', reject);
+    });
+    const newWaitingRoom = await emit(sockets[2], 'lobby:create', {
+      capacity: 2,
+      boardId: 1,
+      zonePointValues: pointValues,
+    });
+    assert.equal(newWaitingRoom.room.players[0].id, 'player-3');
+    await emit(sockets[2], 'lobby:leave', {});
+    await emit(sockets[0], 'lobby:leave', {});
+
     const created = await emit(sockets[0], 'lobby:create', {
       capacity: 2,
       boardId: 1,

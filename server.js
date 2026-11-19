@@ -870,8 +870,7 @@ io.on('connection', (socket) => {
     player.socketId = null;
     player.connected = false;
     if (room.status === 'waiting') {
-      startDisconnectGracePeriod(room, player.id);
-      broadcastRoom(room);
+      removePlayerFromWaitingRoom(room, player.id);
     } else if (room.status === 'playing') {
       startDisconnectGracePeriod(room, player.id);
       advanceTurnIfConnectedPlayersCompleted(room);
