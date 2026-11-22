@@ -76,11 +76,80 @@ function ensureDatabaseReady() {
         'ALTER TABLE users ADD COLUMN IF NOT EXISTS active_session_id TEXT',
       );
       await dbRun(
+        'ALTER TABLE users ADD COLUMN IF NOT EXISTS ranked_points INTEGER NOT NULL DEFAULT 0',
+      );
+      await dbRun(
         'CREATE UNIQUE INDEX IF NOT EXISTS users_username_unique_idx ON users (username)',
       );
     })();
   }
   return databaseReady;
+}
+
+function getRankedLevel(points = 0) {
+  const safePoints = Math.max(0, Number(points) || 0);
+  if (safePoints >= 1200) return 'EL Brilliant';
+  if (safePoints >= 750) return 'Megamente';
+  if (safePoints >= 500) return 'Experto';
+  if (safePoints >= 300) return 'Nuevo héroe';
+  return 'Principiante';
+}
+
+function getRankedTier(points = 0) {
+  const safePoints = Math.max(0, Number(points) || 0);
+  if (safePoints >= 1200) return 4;
+  if (safePoints >= 750) return 3;
+  if (safePoints >= 500) return 2;
+  if (safePoints >= 300) return 1;
+  return 0;
+}
+
+function isHigherRankedOpponent(playerPoints, opponentPoints) {
+  return (
+    opponentPoints > playerPoints ||
+    getRankedTier(opponentPoints) > getRankedTier(playerPoints)
+  );
+}
+
+function calculateRankedDelta({
+  matchScore,
+  playerRankedPoints,
+  opponentRankedPoints = [],
+  isWinner,
+  winnerRankedPoints,
+  winnerMatchScore,
+}) {
+  const ownScore = Math.max(0, Number(matchScore) || 0);
+  const ownRanked = Math.max(0, Number(playerRankedPoints) || 0);
+  const hasHigherOpponent = opponentRankedPoints.some((oppPts) =>
+    isHigherRankedOpponent(ownRanked, Math.max(0, Number(oppPts) || 0)),
+  );
+
+  if (isWinner) {
+    return hasHigherOpponent ? Math.round(ownScore * 1.2) : ownScore;
+  }
+
+  const lostAgainstHigher =
+    winnerRankedPoints !== undefined && winnerRankedPoints !== null
+      ? isHigherRankedOpponent(
+          ownRanked,
+          Math.max(0, Number(winnerRankedPoints) || 0),
+        )
+      : hasHigherOpponent;
+  if (lostAgainstHigher) {
+    return 0;
+  }
+
+  const diff =
+    winnerMatchScore !== undefined &&
+    winnerMatchScore !== null &&
+    winnerMatchScore > ownScore
+      ? winnerMatchScore - ownScore
+      : ownScore > 0
+        ? ownScore
+        : 10;
+  const nextPoints = Math.max(0, ownRanked - diff);
+  return nextPoints - ownRanked;
 }
 
 function getTargetPoints(playerCount) {
@@ -292,14 +361,17 @@ io.use(async (socket, next) => {
   try {
     await ensureDatabaseReady();
     const activeUser = await dbGet(
-      'SELECT id FROM users WHERE id = $1 AND active_session_id = $2',
+      'SELECT id, ranked_points FROM users WHERE id = $1 AND active_session_id = $2',
       [user.id, user.sessionId],
     );
     if (!activeUser) {
       next(new Error('Esta sesión ya no está activa. Vuelve a iniciar sesión.'));
       return;
     }
-    socket.data.user = user;
+    socket.data.user = {
+      ...user,
+      rankedPoints: Math.max(0, Number(activeUser.ranked_points) || 0),
+    };
     next();
   } catch (error) {
     next(error);
@@ -327,6 +399,7 @@ function roomSummary(room) {
     boardId: room.boardId,
     targetPoints: room.targetPoints,
     status: room.status,
+    ranked: Boolean(room.ranked),
     players: [...room.players.values()].map((player) => ({
       id: player.id,
       username: player.username,
@@ -335,6 +408,9 @@ function roomSummary(room) {
       score: player.score,
       finished: player.finished,
       setupComplete: player.setupComplete,
+      rankedPoints: player.rankedPoints ?? 0,
+      rankedDelta: player.rankedDelta ?? null,
+      rankedLevel: getRankedLevel(player.rankedPoints ?? 0),
     })),
   };
 }
@@ -391,6 +467,38 @@ function finishRoom(room, winnerId) {
     clearTimeout(timer);
   }
   room.disconnectTimers.clear();
+
+  if (room.ranked && winnerId) {
+    const players = [...room.players.values()];
+    const winner = room.players.get(String(winnerId));
+    const initialPointsByPlayer = new Map(
+      players.map((p) => [p.id, Math.max(0, Number(p.rankedPoints) || 0)]),
+    );
+    const winnerInitialRanked = winner
+      ? initialPointsByPlayer.get(winner.id) ?? 0
+      : 0;
+
+    for (const player of players) {
+      const ownInitial = initialPointsByPlayer.get(player.id) ?? 0;
+      const opponentPoints = players
+        .filter((other) => other.id !== player.id)
+        .map((other) => initialPointsByPlayer.get(other.id) ?? 0);
+      const delta = calculateRankedDelta({
+        matchScore: player.score,
+        playerRankedPoints: ownInitial,
+        opponentRankedPoints: opponentPoints,
+        isWinner: player.id === String(winnerId),
+        winnerRankedPoints: winnerInitialRanked,
+        winnerMatchScore: winner?.score,
+      });
+      player.rankedDelta = delta;
+      player.rankedPoints = Math.max(0, ownInitial + delta);
+      dbRun('UPDATE users SET ranked_points = $2 WHERE id = $1', [
+        player.id,
+        player.rankedPoints,
+      ]).catch(() => {});
+    }
+  }
 }
 
 function startGameIfReady(room) {
@@ -514,6 +622,50 @@ function removePlayerFromWaitingRoom(room, playerId) {
   broadcastRoom(room);
 }
 
+function cleanupStaleRoomsForUser(userId, targetRoomCode = null) {
+  for (const existingRoom of [...rooms.values()]) {
+    if (existingRoom.code === targetRoomCode) continue;
+    if (existingRoom.status === 'finished') continue;
+    const player = existingRoom.players.get(userId);
+    if (!player) continue;
+
+    if (existingRoom.status === 'waiting') {
+      removePlayerFromWaitingRoom(existingRoom, userId);
+    } else if (!player.connected || player.finished) {
+      cancelDisconnectTimer(existingRoom, userId);
+      existingRoom.players.delete(userId);
+      existingRoom.completedPlayerIds.delete(userId);
+      const playersStillInGame = [...existingRoom.players.values()].filter(
+        (item) => !item.finished,
+      );
+      const connectedPlayers = playersStillInGame.filter(
+        (item) => item.connected,
+      );
+      if (existingRoom.players.size === 0) {
+        rooms.delete(existingRoom.code);
+      } else if (
+        playersStillInGame.length === 1 &&
+        connectedPlayers.length === 1
+      ) {
+        finishRoom(existingRoom, connectedPlayers[0].id);
+        broadcastGame(existingRoom);
+      } else if (connectedPlayers.length > 0) {
+        if (
+          existingRoom.phase === 'setup' &&
+          playersStillInGame.every((item) => item.setupComplete)
+        ) {
+          existingRoom.phase = 'playing';
+        }
+        advanceTurnIfConnectedPlayersCompleted(existingRoom);
+        broadcastGame(existingRoom);
+      } else if (playersStillInGame.length === 0) {
+        finishRoom(existingRoom, null);
+        broadcastGame(existingRoom);
+      }
+    }
+  }
+}
+
 io.on('connection', (socket) => {
   socket.data.user.id = String(socket.data.user.id);
 
@@ -553,6 +705,7 @@ io.on('connection', (socket) => {
       }
 
       const user = socket.data.user;
+      cleanupStaleRoomsForUser(user.id);
       const alreadyPlaying = [...rooms.values()].some(
         (room) => room.players.has(user.id) && room.status !== 'finished',
       );
@@ -563,6 +716,13 @@ io.on('connection', (socket) => {
         code = crypto.randomBytes(3).toString('hex').toUpperCase();
       } while (rooms.has(code));
 
+      const ranked = payload.ranked === true;
+      const userRankedPoints = Math.max(
+        0,
+        Number(payload.rankedPoints ?? user.rankedPoints) || 0,
+      );
+      user.rankedPoints = userRankedPoints;
+
       const room = {
         code,
         hostId: user.id,
@@ -571,6 +731,7 @@ io.on('connection', (socket) => {
         targetPoints,
         zonePointValues: pointValues,
         status: 'waiting',
+        ranked,
         players: new Map([
           [
             user.id,
@@ -584,6 +745,8 @@ io.on('connection', (socket) => {
               finished: false,
               setupComplete: false,
               board: null,
+              rankedPoints: userRankedPoints,
+              rankedDelta: null,
             },
           ],
         ]),
@@ -626,6 +789,7 @@ io.on('connection', (socket) => {
         throw new Error('La sala está llena.');
       }
 
+      cleanupStaleRoomsForUser(user.id, room.code);
       const alreadyPlaying = [...rooms.values()].some(
         (otherRoom) =>
           otherRoom.code !== room.code &&
@@ -633,6 +797,12 @@ io.on('connection', (socket) => {
           otherRoom.status !== 'finished',
       );
       if (alreadyPlaying) throw new Error('Ya estás participando en otra sala.');
+
+      const userRankedPoints = Math.max(
+        0,
+        Number(payload.rankedPoints ?? user.rankedPoints) || 0,
+      );
+      user.rankedPoints = userRankedPoints;
 
       if (existingPlayer) {
         cancelDisconnectTimer(room, user.id);
@@ -649,6 +819,8 @@ io.on('connection', (socket) => {
           finished: false,
           setupComplete: false,
           board: null,
+          rankedPoints: userRankedPoints,
+          rankedDelta: null,
         });
       }
 
@@ -830,6 +1002,14 @@ io.on('connection', (socket) => {
         }
       }
 
+      if (room.ranked) {
+        for (const player of room.players.values()) {
+          if (player.id === socket.data.user.id) {
+            socket.data.user.rankedPoints = player.rankedPoints;
+          }
+        }
+      }
+
       const snapshot = gameSnapshot(room);
       acknowledge(ack, { state: snapshot });
       broadcastGame(room);
@@ -920,6 +1100,9 @@ module.exports = {
   rooms,
   getTargetPoints,
   getZoneAward,
+  getRankedLevel,
+  getRankedTier,
+  calculateRankedDelta,
   DEFAULT_DISCONNECT_GRACE_PERIOD_MS,
   DISCONNECT_GRACE_PERIOD_MS,
   start,

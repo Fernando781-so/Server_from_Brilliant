@@ -9,6 +9,8 @@ const {
   DISCONNECT_GRACE_PERIOD_MS,
   getTargetPoints,
   getZoneAward,
+  getRankedLevel,
+  calculateRankedDelta,
 } = require('../server');
 const { io, pool, server } = require('../server');
 
@@ -45,6 +47,40 @@ test('mantiene el puntaje mínimo de una zona luego de agotarse su bolsa', () =>
 test('usa cinco minutos de gracia por defecto y permite reducirlo en pruebas', () => {
   assert.equal(DEFAULT_DISCONNECT_GRACE_PERIOD_MS, 5 * 60 * 1000);
   assert.equal(DISCONNECT_GRACE_PERIOD_MS, 100);
+});
+
+test('calcula niveles y puntos de modo ranked clasificatoria', () => {
+  assert.equal(getRankedLevel(100), 'Principiante');
+  assert.equal(getRankedLevel(300), 'Nuevo héroe');
+  assert.equal(getRankedLevel(500), 'Experto');
+  assert.equal(getRankedLevel(750), 'Megamente');
+  assert.equal(getRankedLevel(1200), 'EL Brilliant');
+
+  // Pierde contra un jugador destacado por encima: no bajan puntos
+  assert.equal(
+    calculateRankedDelta({
+      matchScore: 18,
+      playerRankedPoints: 100,
+      opponentRankedPoints: [300],
+      isWinner: false,
+      winnerRankedPoints: 300,
+      winnerMatchScore: 26,
+    }),
+    0,
+  );
+
+  // Gana contra un jugador destacado por encima: aumenta un 20% de sus puntos ganados
+  assert.equal(
+    calculateRankedDelta({
+      matchScore: 25,
+      playerRankedPoints: 100,
+      opponentRankedPoints: [300],
+      isWinner: true,
+      winnerRankedPoints: 100,
+      winnerMatchScore: 25,
+    }),
+    30,
+  );
 });
 
 test('espera la configuración inicial, reconexión y turnos de todos', async () => {
@@ -438,6 +474,80 @@ test('espera la configuración inicial, reconexión y turnos de todos', async ()
         .finished,
       true,
     );
+
+    // Prueba de salida de partida en ejecución / en espera y creación inmediata de nueva sala clasificatoria sin error
+    const rankedRoomOne = await emit(sockets[0], 'lobby:create', {
+      capacity: 2,
+      boardId: 1,
+      zonePointValues: [[30, 20, 10]],
+      ranked: true,
+      rankedPoints: 100,
+    });
+    assert.equal(rankedRoomOne.room.ranked, true);
+    assert.equal(rankedRoomOne.room.players[0].rankedPoints, 100);
+    assert.equal(rankedRoomOne.room.players[0].rankedLevel, 'Principiante');
+
+    // Al salir de la sala en espera y crear otra de inmediato no marca error en el primer intento
+    await emit(sockets[0], 'lobby:leave', {});
+    const rankedRoomTwo = await emit(sockets[0], 'lobby:create', {
+      capacity: 2,
+      boardId: 1,
+      zonePointValues: [[30, 20, 10]],
+      ranked: true,
+      rankedPoints: 100,
+    });
+    assert.equal(rankedRoomTwo.room.ranked, true);
+
+    await emit(sockets[2], 'lobby:join', {
+      code: rankedRoomTwo.room.code,
+      rankedPoints: 300,
+    });
+    const rankedStarted = [
+      waitFor(sockets[0], 'game:start'),
+      waitFor(sockets[2], 'game:start'),
+    ];
+    await emit(sockets[0], 'lobby:ready', { ready: true });
+    await emit(sockets[2], 'lobby:ready', { ready: true });
+    const [rankedStartState] = await Promise.all(rankedStarted);
+    assert.equal(
+      rankedStartState.room.players.find((p) => p.id === 'player-3').rankedLevel,
+      'Nuevo héroe',
+    );
+
+    // Si un jugador se sale de la partida en ejecución y crea otra sala de inmediato, funciona al primer intento
+    await emit(sockets[2], 'lobby:leave', {});
+    const roomAfterLeavingRunningGame = await emit(sockets[2], 'lobby:create', {
+      capacity: 2,
+      boardId: 1,
+      zonePointValues: [[30, 20, 10]],
+      ranked: true,
+      rankedPoints: 300,
+    });
+    assert.equal(roomAfterLeavingRunningGame.room.hostId, 'player-3');
+
+    // Ahora player-1 (100 pts, Principiante) se une a la sala de player-3 (300 pts, Nuevo héroe) y le gana
+    await emit(sockets[0], 'lobby:leave', {});
+    await emit(sockets[0], 'lobby:join', {
+      code: roomAfterLeavingRunningGame.room.code,
+      rankedPoints: 100,
+    });
+    await emit(sockets[2], 'lobby:ready', { ready: true });
+    await emit(sockets[0], 'lobby:ready', { ready: true });
+    await emit(sockets[2], 'game:setup-complete', { board: setupBoard });
+    await emit(sockets[0], 'game:setup-complete', { board: setupBoard });
+
+    // player-1 captura zona de 30 pts y gana contra player-3 (que tenía 300 pts > 100 pts)
+    const rankedFinishResult = await emit(sockets[0], 'game:turn-complete', {
+      board,
+      completedZones: [0],
+      finished: true,
+    });
+    const winnerRankedPlayer = rankedFinishResult.state.room.players.find(
+      (p) => p.id === 'player-1',
+    );
+    // 30 pts ganados + 20% por vencer a rival destacado superior = +36 pts (100 -> 136)
+    assert.equal(winnerRankedPlayer.rankedDelta, 36);
+    assert.equal(winnerRankedPlayer.rankedPoints, 136);
   } finally {
     for (const socket of sockets) socket.disconnect();
     await new Promise((resolve) => io.close(resolve));
