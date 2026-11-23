@@ -400,6 +400,7 @@ function roomSummary(room) {
     targetPoints: room.targetPoints,
     status: room.status,
     ranked: Boolean(room.ranked),
+    timeTrial: Boolean(room.timeTrial),
     players: [...room.players.values()].map((player) => ({
       id: player.id,
       username: player.username,
@@ -717,6 +718,7 @@ io.on('connection', (socket) => {
       } while (rooms.has(code));
 
       const ranked = payload.ranked === true;
+      const timeTrial = payload.timeTrial === true;
       const userRankedPoints = Math.max(
         0,
         Number(payload.rankedPoints ?? user.rankedPoints) || 0,
@@ -732,6 +734,7 @@ io.on('connection', (socket) => {
         zonePointValues: pointValues,
         status: 'waiting',
         ranked,
+        timeTrial,
         players: new Map([
           [
             user.id,
