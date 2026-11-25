@@ -76,7 +76,16 @@ function ensureDatabaseReady() {
         'ALTER TABLE users ADD COLUMN IF NOT EXISTS active_session_id TEXT',
       );
       await dbRun(
-        'ALTER TABLE users ADD COLUMN IF NOT EXISTS ranked_points INTEGER NOT NULL DEFAULT 0',
+        'ALTER TABLE users ADD COLUMN IF NOT EXISTS ranked_points INTEGER NOT NULL DEFAULT 1000',
+      );
+      await dbRun(
+        'ALTER TABLE users ADD COLUMN IF NOT EXISTS ranked_games INTEGER NOT NULL DEFAULT 0',
+      );
+      await dbRun(
+        'ALTER TABLE users ALTER COLUMN ranked_points SET DEFAULT 1000',
+      );
+      await dbRun(
+        'UPDATE users SET ranked_points = 1000 WHERE ranked_points = 0 AND ranked_games = 0',
       );
       await dbRun(
         'CREATE UNIQUE INDEX IF NOT EXISTS users_username_unique_idx ON users (username)',
@@ -86,70 +95,128 @@ function ensureDatabaseReady() {
   return databaseReady;
 }
 
-function getRankedLevel(points = 0) {
-  const safePoints = Math.max(0, Number(points) || 0);
-  if (safePoints >= 1200) return 'EL Brilliant';
-  if (safePoints >= 750) return 'Megamente';
-  if (safePoints >= 500) return 'Experto';
-  if (safePoints >= 300) return 'Nuevo héroe';
+const INITIAL_ELO = 1000;
+const MIN_ELO = 100;
+const ELO_K_PROVISIONAL = 40;
+const ELO_K_NORMAL = 32;
+const ELO_K_MASTER = 24;
+
+function getRankedLevel(elo = INITIAL_ELO) {
+  const safeElo = Math.max(0, Number(elo) || 0);
+  if (safeElo >= 1500) return 'EL Brilliant';
+  if (safeElo >= 1300) return 'Megamente';
+  if (safeElo >= 1150) return 'Experto';
+  if (safeElo >= 1000) return 'Nuevo héroe';
   return 'Principiante';
 }
 
-function getRankedTier(points = 0) {
-  const safePoints = Math.max(0, Number(points) || 0);
-  if (safePoints >= 1200) return 4;
-  if (safePoints >= 750) return 3;
-  if (safePoints >= 500) return 2;
-  if (safePoints >= 300) return 1;
+function getRankedTier(elo = INITIAL_ELO) {
+  const safeElo = Math.max(0, Number(elo) || 0);
+  if (safeElo >= 1500) return 4;
+  if (safeElo >= 1300) return 3;
+  if (safeElo >= 1150) return 2;
+  if (safeElo >= 1000) return 1;
   return 0;
 }
 
-function isHigherRankedOpponent(playerPoints, opponentPoints) {
-  return (
-    opponentPoints > playerPoints ||
-    getRankedTier(opponentPoints) > getRankedTier(playerPoints)
-  );
+function getEloKFactor(elo = INITIAL_ELO, rankedGames = 0) {
+  const games = Math.max(0, Number(rankedGames) || 0);
+  const safeElo = Math.max(MIN_ELO, Number(elo) || INITIAL_ELO);
+  if (games < 10) return ELO_K_PROVISIONAL;
+  if (safeElo >= 1500) return ELO_K_MASTER;
+  return ELO_K_NORMAL;
+}
+
+function calculateMultiplayerEloDeltas(players = [], winnerId = null) {
+  const deltas = new Map();
+  if (!Array.isArray(players) || players.length < 2) {
+    for (const player of players || []) {
+      deltas.set(String(player.id), 0);
+    }
+    return deltas;
+  }
+
+  const opponentCount = players.length - 1;
+  for (const player of players) {
+    const playerId = String(player.id);
+    const ownElo = Math.max(
+      MIN_ELO,
+      Number(player.rankedPoints ?? player.elo ?? INITIAL_ELO) || INITIAL_ELO,
+    );
+    const ownScore = Number(player.score) || 0;
+    const kFactor = getEloKFactor(ownElo, player.rankedGames ?? 0);
+
+    let scoreDiffSum = 0;
+    for (const opponent of players) {
+      const opponentId = String(opponent.id);
+      if (opponentId === playerId) continue;
+
+      const oppElo = Math.max(
+        MIN_ELO,
+        Number(opponent.rankedPoints ?? opponent.elo ?? INITIAL_ELO) ||
+          INITIAL_ELO,
+      );
+      const oppScore = Number(opponent.score) || 0;
+      const expected = 1 / (1 + 10 ** ((oppElo - ownElo) / 400));
+
+      let actual;
+      if (ownScore > oppScore) {
+        actual = 1;
+      } else if (ownScore < oppScore) {
+        actual = 0;
+      } else if (winnerId != null && String(winnerId) === playerId) {
+        actual = 1;
+      } else if (winnerId != null && String(winnerId) === opponentId) {
+        actual = 0;
+      } else {
+        actual = 0.5;
+      }
+
+      scoreDiffSum += actual - expected;
+    }
+
+    const rawDelta = Math.round((kFactor / opponentCount) * scoreDiffSum);
+    const nextElo = Math.max(MIN_ELO, ownElo + rawDelta);
+    deltas.set(playerId, nextElo - ownElo);
+  }
+
+  return deltas;
 }
 
 function calculateRankedDelta({
   matchScore,
-  playerRankedPoints,
+  playerRankedPoints = INITIAL_ELO,
+  playerRankedGames = 0,
   opponentRankedPoints = [],
-  isWinner,
-  winnerRankedPoints,
+  opponentScores = [],
+  isWinner = false,
   winnerMatchScore,
 }) {
-  const ownScore = Math.max(0, Number(matchScore) || 0);
-  const ownRanked = Math.max(0, Number(playerRankedPoints) || 0);
-  const hasHigherOpponent = opponentRankedPoints.some((oppPts) =>
-    isHigherRankedOpponent(ownRanked, Math.max(0, Number(oppPts) || 0)),
+  const opponents = opponentRankedPoints.map((oppElo, index) => ({
+    id: `opp-${index}`,
+    rankedPoints: oppElo,
+    rankedGames: 0,
+    score:
+      opponentScores[index] !== undefined
+        ? opponentScores[index]
+        : isWinner
+          ? Math.max(0, (Number(matchScore) || 0) - 1)
+          : Math.max((Number(matchScore) || 0) + 1, Number(winnerMatchScore) || 1),
+  }));
+  const participants = [
+    {
+      id: 'self',
+      rankedPoints: playerRankedPoints,
+      rankedGames: playerRankedGames,
+      score: Number(matchScore) || 0,
+    },
+    ...opponents,
+  ];
+  return (
+    calculateMultiplayerEloDeltas(participants, isWinner ? 'self' : null).get(
+      'self',
+    ) ?? 0
   );
-
-  if (isWinner) {
-    return hasHigherOpponent ? Math.round(ownScore * 1.2) : ownScore;
-  }
-
-  const lostAgainstHigher =
-    winnerRankedPoints !== undefined && winnerRankedPoints !== null
-      ? isHigherRankedOpponent(
-          ownRanked,
-          Math.max(0, Number(winnerRankedPoints) || 0),
-        )
-      : hasHigherOpponent;
-  if (lostAgainstHigher) {
-    return 0;
-  }
-
-  const diff =
-    winnerMatchScore !== undefined &&
-    winnerMatchScore !== null &&
-    winnerMatchScore > ownScore
-      ? winnerMatchScore - ownScore
-      : ownScore > 0
-        ? ownScore
-        : 10;
-  const nextPoints = Math.max(0, ownRanked - diff);
-  return nextPoints - ownRanked;
 }
 
 function getTargetPoints(playerCount) {
@@ -361,16 +428,22 @@ io.use(async (socket, next) => {
   try {
     await ensureDatabaseReady();
     const activeUser = await dbGet(
-      'SELECT id, ranked_points FROM users WHERE id = $1 AND active_session_id = $2',
+      'SELECT id, ranked_points, ranked_games FROM users WHERE id = $1 AND active_session_id = $2',
       [user.id, user.sessionId],
     );
     if (!activeUser) {
       next(new Error('Esta sesión ya no está activa. Vuelve a iniciar sesión.'));
       return;
     }
+    const storedElo = Number(activeUser.ranked_points);
+    const storedGames = Math.max(0, Number(activeUser.ranked_games) || 0);
     socket.data.user = {
       ...user,
-      rankedPoints: Math.max(0, Number(activeUser.ranked_points) || 0),
+      rankedPoints:
+        Number.isFinite(storedElo) && storedElo >= MIN_ELO
+          ? storedElo
+          : INITIAL_ELO,
+      rankedGames: storedGames,
     };
     next();
   } catch (error) {
@@ -409,9 +482,10 @@ function roomSummary(room) {
       score: player.score,
       finished: player.finished,
       setupComplete: player.setupComplete,
-      rankedPoints: player.rankedPoints ?? 0,
+      rankedPoints: player.rankedPoints ?? INITIAL_ELO,
       rankedDelta: player.rankedDelta ?? null,
-      rankedLevel: getRankedLevel(player.rankedPoints ?? 0),
+      rankedGames: player.rankedGames ?? 0,
+      rankedLevel: getRankedLevel(player.rankedPoints ?? INITIAL_ELO),
     })),
   };
 }
@@ -469,35 +543,23 @@ function finishRoom(room, winnerId) {
   }
   room.disconnectTimers.clear();
 
-  if (room.ranked && winnerId) {
+  if (room.ranked && room.players.size >= 2) {
     const players = [...room.players.values()];
-    const winner = room.players.get(String(winnerId));
-    const initialPointsByPlayer = new Map(
-      players.map((p) => [p.id, Math.max(0, Number(p.rankedPoints) || 0)]),
-    );
-    const winnerInitialRanked = winner
-      ? initialPointsByPlayer.get(winner.id) ?? 0
-      : 0;
+    const deltas = calculateMultiplayerEloDeltas(players, winnerId);
 
     for (const player of players) {
-      const ownInitial = initialPointsByPlayer.get(player.id) ?? 0;
-      const opponentPoints = players
-        .filter((other) => other.id !== player.id)
-        .map((other) => initialPointsByPlayer.get(other.id) ?? 0);
-      const delta = calculateRankedDelta({
-        matchScore: player.score,
-        playerRankedPoints: ownInitial,
-        opponentRankedPoints: opponentPoints,
-        isWinner: player.id === String(winnerId),
-        winnerRankedPoints: winnerInitialRanked,
-        winnerMatchScore: winner?.score,
-      });
+      const ownInitial = Math.max(
+        MIN_ELO,
+        Number(player.rankedPoints ?? INITIAL_ELO) || INITIAL_ELO,
+      );
+      const delta = deltas.get(String(player.id)) ?? 0;
       player.rankedDelta = delta;
-      player.rankedPoints = Math.max(0, ownInitial + delta);
-      dbRun('UPDATE users SET ranked_points = $2 WHERE id = $1', [
-        player.id,
-        player.rankedPoints,
-      ]).catch(() => {});
+      player.rankedPoints = Math.max(MIN_ELO, ownInitial + delta);
+      player.rankedGames = Math.max(0, Number(player.rankedGames) || 0) + 1;
+      dbRun(
+        'UPDATE users SET ranked_points = $2, ranked_games = $3 WHERE id = $1',
+        [player.id, player.rankedPoints, player.rankedGames],
+      ).catch(() => {});
     }
   }
 }
@@ -720,10 +782,16 @@ io.on('connection', (socket) => {
       const ranked = payload.ranked === true;
       const timeTrial = payload.timeTrial === true;
       const userRankedPoints = Math.max(
+        MIN_ELO,
+        Number(payload.rankedPoints ?? user.rankedPoints ?? INITIAL_ELO) ||
+          INITIAL_ELO,
+      );
+      const userRankedGames = Math.max(
         0,
-        Number(payload.rankedPoints ?? user.rankedPoints) || 0,
+        Number(payload.rankedGames ?? user.rankedGames) || 0,
       );
       user.rankedPoints = userRankedPoints;
+      user.rankedGames = userRankedGames;
 
       const room = {
         code,
@@ -749,6 +817,7 @@ io.on('connection', (socket) => {
               setupComplete: false,
               board: null,
               rankedPoints: userRankedPoints,
+              rankedGames: userRankedGames,
               rankedDelta: null,
             },
           ],
@@ -802,10 +871,16 @@ io.on('connection', (socket) => {
       if (alreadyPlaying) throw new Error('Ya estás participando en otra sala.');
 
       const userRankedPoints = Math.max(
+        MIN_ELO,
+        Number(payload.rankedPoints ?? user.rankedPoints ?? INITIAL_ELO) ||
+          INITIAL_ELO,
+      );
+      const userRankedGames = Math.max(
         0,
-        Number(payload.rankedPoints ?? user.rankedPoints) || 0,
+        Number(payload.rankedGames ?? user.rankedGames) || 0,
       );
       user.rankedPoints = userRankedPoints;
+      user.rankedGames = userRankedGames;
 
       if (existingPlayer) {
         cancelDisconnectTimer(room, user.id);
@@ -823,6 +898,7 @@ io.on('connection', (socket) => {
           setupComplete: false,
           board: null,
           rankedPoints: userRankedPoints,
+          rankedGames: userRankedGames,
           rankedDelta: null,
         });
       }
@@ -1009,6 +1085,7 @@ io.on('connection', (socket) => {
         for (const player of room.players.values()) {
           if (player.id === socket.data.user.id) {
             socket.data.user.rankedPoints = player.rankedPoints;
+            socket.data.user.rankedGames = player.rankedGames;
           }
         }
       }
@@ -1103,8 +1180,12 @@ module.exports = {
   rooms,
   getTargetPoints,
   getZoneAward,
+  INITIAL_ELO,
+  MIN_ELO,
   getRankedLevel,
   getRankedTier,
+  getEloKFactor,
+  calculateMultiplayerEloDeltas,
   calculateRankedDelta,
   DEFAULT_DISCONNECT_GRACE_PERIOD_MS,
   DISCONNECT_GRACE_PERIOD_MS,

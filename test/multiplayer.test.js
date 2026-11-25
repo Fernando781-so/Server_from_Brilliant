@@ -10,6 +10,8 @@ const {
   getTargetPoints,
   getZoneAward,
   getRankedLevel,
+  getEloKFactor,
+  calculateMultiplayerEloDeltas,
   calculateRankedDelta,
 } = require('../server');
 const { io, pool, server } = require('../server');
@@ -49,38 +51,41 @@ test('usa cinco minutos de gracia por defecto y permite reducirlo en pruebas', (
   assert.equal(DISCONNECT_GRACE_PERIOD_MS, 100);
 });
 
-test('calcula niveles y puntos de modo ranked clasificatoria', () => {
-  assert.equal(getRankedLevel(100), 'Principiante');
-  assert.equal(getRankedLevel(300), 'Nuevo héroe');
-  assert.equal(getRankedLevel(500), 'Experto');
-  assert.equal(getRankedLevel(750), 'Megamente');
-  assert.equal(getRankedLevel(1200), 'EL Brilliant');
+test('calcula niveles y sistema ELO multijugador en modo ranked clasificatoria', () => {
+  assert.equal(getRankedLevel(999), 'Principiante');
+  assert.equal(getRankedLevel(1000), 'Nuevo héroe');
+  assert.equal(getRankedLevel(1150), 'Experto');
+  assert.equal(getRankedLevel(1300), 'Megamente');
+  assert.equal(getRankedLevel(1500), 'EL Brilliant');
 
-  // Pierde contra un jugador destacado por encima: no bajan puntos
-  assert.equal(
-    calculateRankedDelta({
-      matchScore: 18,
-      playerRankedPoints: 100,
-      opponentRankedPoints: [300],
-      isWinner: false,
-      winnerRankedPoints: 300,
-      winnerMatchScore: 26,
-    }),
-    0,
-  );
+  // K dinámico: 40 primeras 10 partidas, 32 normal, 24 en EL Brilliant
+  assert.equal(getEloKFactor(1000, 0), 40);
+  assert.equal(getEloKFactor(1000, 10), 32);
+  assert.equal(getEloKFactor(1500, 10), 24);
 
-  // Gana contra un jugador destacado por encima: aumenta un 20% de sus puntos ganados
-  assert.equal(
-    calculateRankedDelta({
-      matchScore: 25,
-      playerRankedPoints: 100,
-      opponentRankedPoints: [300],
-      isWinner: true,
-      winnerRankedPoints: 100,
-      winnerMatchScore: 25,
-    }),
-    30,
-  );
+  // Duelo 2 jugadores iguales (1000 vs 1000, K=40): ganador +20, perdedor -20
+  const duel = calculateMultiplayerEloDeltas([
+    { id: 'a', score: 30, rankedPoints: 1000, rankedGames: 0 },
+    { id: 'b', score: 18, rankedPoints: 1000, rankedGames: 0 },
+  ]);
+  assert.equal(duel.get('a'), 20);
+  assert.equal(duel.get('b'), -20);
+
+  // 3 jugadores FFA (normalizado por N-1 = 2): 1º (1000) vence a 2º (1200) y 3º (1400)
+  const ffa = calculateMultiplayerEloDeltas([
+    { id: 'a', score: 40, rankedPoints: 1000, rankedGames: 15 },
+    { id: 'b', score: 30, rankedPoints: 1200, rankedGames: 15 },
+    { id: 'c', score: 20, rankedPoints: 1400, rankedGames: 15 },
+  ]);
+  assert.ok(ffa.get('a') > 20);
+  assert.ok(ffa.get('c') < -20);
+
+  // Piso mínimo de 100 ELO
+  const floorTest = calculateMultiplayerEloDeltas([
+    { id: 'low', score: 5, rankedPoints: 105, rankedGames: 0 },
+    { id: 'mid', score: 25, rankedPoints: 1000, rankedGames: 0 },
+  ]);
+  assert.ok(105 + floorTest.get('low') >= 100);
 });
 
 test('espera la configuración inicial, reconexión y turnos de todos', async () => {
@@ -494,13 +499,13 @@ test('espera la configuración inicial, reconexión y turnos de todos', async ()
       boardId: 1,
       zonePointValues: [[30, 20, 10]],
       ranked: true,
-      rankedPoints: 100,
+      rankedPoints: 950,
     });
     assert.equal(rankedRoomTwo.room.ranked, true);
 
     await emit(sockets[2], 'lobby:join', {
       code: rankedRoomTwo.room.code,
-      rankedPoints: 300,
+      rankedPoints: 1100,
     });
     const rankedStarted = [
       waitFor(sockets[0], 'game:start'),
@@ -521,22 +526,22 @@ test('espera la configuración inicial, reconexión y turnos de todos', async ()
       boardId: 1,
       zonePointValues: [[30, 20, 10]],
       ranked: true,
-      rankedPoints: 300,
+      rankedPoints: 1200,
     });
     assert.equal(roomAfterLeavingRunningGame.room.hostId, 'player-3');
 
-    // Ahora player-1 (100 pts, Principiante) se une a la sala de player-3 (300 pts, Nuevo héroe) y le gana
+    // Ahora player-1 (1000 ELO, Nuevo héroe) se une a la sala de player-3 (1200 ELO, Experto) y le gana
     await emit(sockets[0], 'lobby:leave', {});
     await emit(sockets[0], 'lobby:join', {
       code: roomAfterLeavingRunningGame.room.code,
-      rankedPoints: 100,
+      rankedPoints: 1000,
     });
     await emit(sockets[2], 'lobby:ready', { ready: true });
     await emit(sockets[0], 'lobby:ready', { ready: true });
     await emit(sockets[2], 'game:setup-complete', { board: setupBoard });
     await emit(sockets[0], 'game:setup-complete', { board: setupBoard });
 
-    // player-1 captura zona de 30 pts y gana contra player-3 (que tenía 300 pts > 100 pts)
+    // player-1 (1000 ELO, K=40) vence a player-3 (1200 ELO): esperado ~0.2403 -> +30 ELO (1000 -> 1030)
     const rankedFinishResult = await emit(sockets[0], 'game:turn-complete', {
       board,
       completedZones: [0],
@@ -545,9 +550,13 @@ test('espera la configuración inicial, reconexión y turnos de todos', async ()
     const winnerRankedPlayer = rankedFinishResult.state.room.players.find(
       (p) => p.id === 'player-1',
     );
-    // 30 pts ganados + 20% por vencer a rival destacado superior = +36 pts (100 -> 136)
-    assert.equal(winnerRankedPlayer.rankedDelta, 36);
-    assert.equal(winnerRankedPlayer.rankedPoints, 136);
+    const loserRankedPlayer = rankedFinishResult.state.room.players.find(
+      (p) => p.id === 'player-3',
+    );
+    assert.equal(winnerRankedPlayer.rankedDelta, 30);
+    assert.equal(winnerRankedPlayer.rankedPoints, 1030);
+    assert.equal(loserRankedPlayer.rankedDelta, -30);
+    assert.equal(loserRankedPlayer.rankedPoints, 1170);
   } finally {
     for (const socket of sockets) socket.disconnect();
     await new Promise((resolve) => io.close(resolve));
