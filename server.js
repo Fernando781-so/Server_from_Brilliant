@@ -82,6 +82,15 @@ function ensureDatabaseReady() {
         'ALTER TABLE users ADD COLUMN IF NOT EXISTS ranked_games INTEGER NOT NULL DEFAULT 0',
       );
       await dbRun(
+        'ALTER TABLE users ADD COLUMN IF NOT EXISTS games_played INTEGER NOT NULL DEFAULT 0',
+      );
+      await dbRun(
+        'ALTER TABLE users ADD COLUMN IF NOT EXISTS wins INTEGER NOT NULL DEFAULT 0',
+      );
+      await dbRun(
+        'ALTER TABLE users ADD COLUMN IF NOT EXISTS current_streak INTEGER NOT NULL DEFAULT 0',
+      );
+      await dbRun(
         'ALTER TABLE users ALTER COLUMN ranked_points SET DEFAULT 1000',
       );
       await dbRun(
@@ -410,6 +419,29 @@ app.get('/api/session', async (req, res) => {
   res.json({ username: user.username });
 });
 
+app.get('/api/profile', async (req, res) => {
+  const user = await getActiveRequestUser(req, res);
+  if (!user) return;
+  const row = await dbGet(
+    'SELECT username, ranked_points, ranked_games, games_played, wins, current_streak FROM users WHERE id = $1',
+    [user.id],
+  );
+  const storedElo = Number(row?.ranked_points);
+  const rankedPoints =
+    Number.isFinite(storedElo) && storedElo >= MIN_ELO
+      ? storedElo
+      : INITIAL_ELO;
+  res.json({
+    username: row?.username || user.username,
+    rankedPoints,
+    rankedLevel: getRankedLevel(rankedPoints),
+    rankedGames: Math.max(0, Number(row?.ranked_games) || 0),
+    gamesPlayed: Math.max(0, Number(row?.games_played) || 0),
+    wins: Math.max(0, Number(row?.wins) || 0),
+    currentStreak: Math.max(0, Number(row?.current_streak) || 0),
+  });
+});
+
 app.post('/api/logout', async (req, res) => {
   const user = await getActiveRequestUser(req, res);
   if (!user) return;
@@ -583,27 +615,47 @@ function finishRoom(room, winnerId) {
   }
   room.disconnectTimers.clear();
 
-  if (room.ranked && room.players.size >= 2) {
+  if (room.players.size >= 2) {
     const players = [...room.players.values()];
-    const results = calculateMultiplayerEloResults(players, winnerId);
+    const results = room.ranked
+      ? calculateMultiplayerEloResults(players, winnerId)
+      : null;
 
     for (const player of players) {
-      const ownInitial = Math.max(
-        MIN_ELO,
-        Number(player.rankedPoints ?? INITIAL_ELO) || INITIAL_ELO,
-      );
-      const result = results.get(String(player.id)) ?? {
-        delta: 0,
-        compensation: null,
-      };
-      player.rankedDelta = result.delta;
-      player.rankedCompensation = result.compensation;
-      player.rankedPoints = Math.max(MIN_ELO, ownInitial + result.delta);
-      player.rankedGames = Math.max(0, Number(player.rankedGames) || 0) + 1;
-      dbRun(
-        'UPDATE users SET ranked_points = $2, ranked_games = $3 WHERE id = $1',
-        [player.id, player.rankedPoints, player.rankedGames],
-      ).catch(() => {});
+      const won = winnerId != null && String(player.id) === String(winnerId);
+      if (room.ranked && results) {
+        const ownInitial = Math.max(
+          MIN_ELO,
+          Number(player.rankedPoints ?? INITIAL_ELO) || INITIAL_ELO,
+        );
+        const result = results.get(String(player.id)) ?? {
+          delta: 0,
+          compensation: null,
+        };
+        player.rankedDelta = result.delta;
+        player.rankedCompensation = result.compensation;
+        player.rankedPoints = Math.max(MIN_ELO, ownInitial + result.delta);
+        player.rankedGames = Math.max(0, Number(player.rankedGames) || 0) + 1;
+        dbRun(
+          `UPDATE users
+           SET ranked_points = $2,
+               ranked_games = $3,
+               games_played = games_played + 1,
+               wins = wins + $4,
+               current_streak = CASE WHEN $4 = 1 THEN current_streak + 1 ELSE 0 END
+           WHERE id = $1`,
+          [player.id, player.rankedPoints, player.rankedGames, won ? 1 : 0],
+        ).catch(() => {});
+      } else {
+        dbRun(
+          `UPDATE users
+           SET games_played = games_played + 1,
+               wins = wins + $2,
+               current_streak = CASE WHEN $2 = 1 THEN current_streak + 1 ELSE 0 END
+           WHERE id = $1`,
+          [player.id, won ? 1 : 0],
+        ).catch(() => {});
+      }
     }
   }
 }
