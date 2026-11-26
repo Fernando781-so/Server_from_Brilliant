@@ -11,6 +11,7 @@ const {
   getZoneAward,
   getRankedLevel,
   getEloKFactor,
+  calculateMultiplayerEloResults,
   calculateMultiplayerEloDeltas,
   calculateRankedDelta,
 } = require('../server');
@@ -83,9 +84,34 @@ test('calcula niveles y sistema ELO multijugador en modo ranked clasificatoria',
   // Piso mínimo de 100 ELO
   const floorTest = calculateMultiplayerEloDeltas([
     { id: 'low', score: 5, rankedPoints: 105, rankedGames: 0 },
-    { id: 'mid', score: 25, rankedPoints: 1000, rankedGames: 0 },
+    { id: 'mid', score: 25, rankedPoints: 105, rankedGames: 0 },
   ]);
-  assert.ok(105 + floorTest.get('low') >= 100);
+  assert.equal(105 + floorTest.get('low'), 100);
+
+  // Compensación Ranked injusto:
+  // Brecha >= 200 pts abajo (1000 vs 1200): pérdida reducida al 50% (-10 -> -5)
+  const shield50 = calculateMultiplayerEloResults([
+    { id: 'fav', score: 30, rankedPoints: 1200, rankedGames: 0 },
+    { id: 'dog', score: 15, rankedPoints: 1000, rankedGames: 0 },
+  ]);
+  assert.equal(shield50.get('dog').delta, -5);
+  assert.match(shield50.get('dog').compensation, /50%/);
+
+  // Brecha >= 300 pts o >= 2 rangos abajo (1000 vs 1300): 0 pts perdidos
+  const shieldZero = calculateMultiplayerEloResults([
+    { id: 'fav', score: 30, rankedPoints: 1300, rankedGames: 0 },
+    { id: 'dog', score: 15, rankedPoints: 1000, rankedGames: 0 },
+  ]);
+  assert.equal(shieldZero.get('dog').delta, 0);
+  assert.match(shieldZero.get('dog').compensation, /0 pts perdidos/);
+
+  // Victoria contra rival >= 200 pts arriba (1000 vence a 1200): +30 * 1.2 = +36
+  const upset = calculateMultiplayerEloResults([
+    { id: 'dog', score: 30, rankedPoints: 1000, rankedGames: 0 },
+    { id: 'fav', score: 15, rankedPoints: 1200, rankedGames: 0 },
+  ]);
+  assert.equal(upset.get('dog').delta, 36);
+  assert.match(upset.get('dog').compensation, /\+20%/);
 });
 
 test('espera la configuración inicial, reconexión y turnos de todos', async () => {
@@ -541,7 +567,7 @@ test('espera la configuración inicial, reconexión y turnos de todos', async ()
     await emit(sockets[2], 'game:setup-complete', { board: setupBoard });
     await emit(sockets[0], 'game:setup-complete', { board: setupBoard });
 
-    // player-1 (1000 ELO, K=40) vence a player-3 (1200 ELO): esperado ~0.2403 -> +30 ELO (1000 -> 1030)
+    // player-1 (1000, K=40) vence a player-3 (1200, brecha 200): +30 * 1.2 = +36 (1000 -> 1036)
     const rankedFinishResult = await emit(sockets[0], 'game:turn-complete', {
       board,
       completedZones: [0],
@@ -553,8 +579,9 @@ test('espera la configuración inicial, reconexión y turnos de todos', async ()
     const loserRankedPlayer = rankedFinishResult.state.room.players.find(
       (p) => p.id === 'player-3',
     );
-    assert.equal(winnerRankedPlayer.rankedDelta, 30);
-    assert.equal(winnerRankedPlayer.rankedPoints, 1030);
+    assert.equal(winnerRankedPlayer.rankedDelta, 36);
+    assert.equal(winnerRankedPlayer.rankedPoints, 1036);
+    assert.match(winnerRankedPlayer.rankedCompensation, /\+20%/);
     assert.equal(loserRankedPlayer.rankedDelta, -30);
     assert.equal(loserRankedPlayer.rankedPoints, 1170);
   } finally {

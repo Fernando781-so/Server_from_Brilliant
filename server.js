@@ -127,13 +127,13 @@ function getEloKFactor(elo = INITIAL_ELO, rankedGames = 0) {
   return ELO_K_NORMAL;
 }
 
-function calculateMultiplayerEloDeltas(players = [], winnerId = null) {
-  const deltas = new Map();
+function calculateMultiplayerEloResults(players = [], winnerId = null) {
+  const results = new Map();
   if (!Array.isArray(players) || players.length < 2) {
     for (const player of players || []) {
-      deltas.set(String(player.id), 0);
+      results.set(String(player.id), { delta: 0, compensation: null });
     }
-    return deltas;
+    return results;
   }
 
   const opponentCount = players.length - 1;
@@ -143,10 +143,15 @@ function calculateMultiplayerEloDeltas(players = [], winnerId = null) {
       MIN_ELO,
       Number(player.rankedPoints ?? player.elo ?? INITIAL_ELO) || INITIAL_ELO,
     );
+    const ownTier = getRankedTier(ownElo);
     const ownScore = Number(player.score) || 0;
     const kFactor = getEloKFactor(ownElo, player.rankedGames ?? 0);
 
     let scoreDiffSum = 0;
+    let maxHigherPtsGapOnLoss = 0;
+    let maxHigherTierGapOnLoss = 0;
+    let beatOpponent200Above = false;
+
     for (const opponent of players) {
       const opponentId = String(opponent.id);
       if (opponentId === playerId) continue;
@@ -156,6 +161,7 @@ function calculateMultiplayerEloDeltas(players = [], winnerId = null) {
         Number(opponent.rankedPoints ?? opponent.elo ?? INITIAL_ELO) ||
           INITIAL_ELO,
       );
+      const oppTier = getRankedTier(oppElo);
       const oppScore = Number(opponent.score) || 0;
       const expected = 1 / (1 + 10 ** ((oppElo - ownElo) / 400));
 
@@ -172,14 +178,47 @@ function calculateMultiplayerEloDeltas(players = [], winnerId = null) {
         actual = 0.5;
       }
 
+      const ptsGap = oppElo - ownElo;
+      const tierGap = oppTier - ownTier;
+      if (actual === 0) {
+        if (ptsGap > maxHigherPtsGapOnLoss) maxHigherPtsGapOnLoss = ptsGap;
+        if (tierGap > maxHigherTierGapOnLoss) maxHigherTierGapOnLoss = tierGap;
+      } else if (actual === 1 && ptsGap >= 200) {
+        beatOpponent200Above = true;
+      }
+
       scoreDiffSum += actual - expected;
     }
 
-    const rawDelta = Math.round((kFactor / opponentCount) * scoreDiffSum);
+    let rawDelta = Math.round((kFactor / opponentCount) * scoreDiffSum);
+    let compensation = null;
+
+    if (rawDelta < 0) {
+      if (maxHigherPtsGapOnLoss >= 300 || maxHigherTierGapOnLoss >= 2) {
+        rawDelta = 0;
+        compensation = 'Escudo por diferencia de nivel (0 pts perdidos)';
+      } else if (maxHigherPtsGapOnLoss >= 200) {
+        rawDelta = -Math.round(Math.abs(rawDelta) * 0.5);
+        compensation = 'Compensación por diferencia de nivel (-50% pérdida)';
+      }
+    } else if (rawDelta > 0 && beatOpponent200Above) {
+      rawDelta = Math.round(rawDelta * 1.2);
+      compensation = 'Bono +20% por vencer a rival superior';
+    }
+
     const nextElo = Math.max(MIN_ELO, ownElo + rawDelta);
-    deltas.set(playerId, nextElo - ownElo);
+    results.set(playerId, { delta: nextElo - ownElo, compensation });
   }
 
+  return results;
+}
+
+function calculateMultiplayerEloDeltas(players = [], winnerId = null) {
+  const results = calculateMultiplayerEloResults(players, winnerId);
+  const deltas = new Map();
+  for (const [id, item] of results.entries()) {
+    deltas.set(id, item.delta);
+  }
   return deltas;
 }
 
@@ -484,6 +523,7 @@ function roomSummary(room) {
       setupComplete: player.setupComplete,
       rankedPoints: player.rankedPoints ?? INITIAL_ELO,
       rankedDelta: player.rankedDelta ?? null,
+      rankedCompensation: player.rankedCompensation ?? null,
       rankedGames: player.rankedGames ?? 0,
       rankedLevel: getRankedLevel(player.rankedPoints ?? INITIAL_ELO),
     })),
@@ -545,16 +585,20 @@ function finishRoom(room, winnerId) {
 
   if (room.ranked && room.players.size >= 2) {
     const players = [...room.players.values()];
-    const deltas = calculateMultiplayerEloDeltas(players, winnerId);
+    const results = calculateMultiplayerEloResults(players, winnerId);
 
     for (const player of players) {
       const ownInitial = Math.max(
         MIN_ELO,
         Number(player.rankedPoints ?? INITIAL_ELO) || INITIAL_ELO,
       );
-      const delta = deltas.get(String(player.id)) ?? 0;
-      player.rankedDelta = delta;
-      player.rankedPoints = Math.max(MIN_ELO, ownInitial + delta);
+      const result = results.get(String(player.id)) ?? {
+        delta: 0,
+        compensation: null,
+      };
+      player.rankedDelta = result.delta;
+      player.rankedCompensation = result.compensation;
+      player.rankedPoints = Math.max(MIN_ELO, ownInitial + result.delta);
       player.rankedGames = Math.max(0, Number(player.rankedGames) || 0) + 1;
       dbRun(
         'UPDATE users SET ranked_points = $2, ranked_games = $3 WHERE id = $1',
@@ -1185,6 +1229,7 @@ module.exports = {
   getRankedLevel,
   getRankedTier,
   getEloKFactor,
+  calculateMultiplayerEloResults,
   calculateMultiplayerEloDeltas,
   calculateRankedDelta,
   DEFAULT_DISCONNECT_GRACE_PERIOD_MS,
